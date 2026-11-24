@@ -18,6 +18,13 @@ load_dotenv(Path(__file__).resolve().parent / ".env")
 # de los reles.
 pi = piControl()
 
+# Cada comando del backend con el rele que le toca. `ESPECIAL_PASS` se escribe
+# asi a proposito: es la ortografia del contrato, no un descuido.
+PASS_HANDLERS = {
+    "NORMAL_PASS": pi.generate_normal_pass,
+    "ESPECIAL_PASS": pi.generate_special_pass,
+}
+
 broker = urlparse(os.environ["PI_MQTT_BROKER_URL"])
 topic = os.environ["PI_MQTT_TOPIC"]
 
@@ -42,11 +49,16 @@ def on_message(client, userdata, message):
         print("Mensaje descartado: no es JSON")
         return
 
-    if command.get("type") == "OPEN_ACCESS":
-        pi.generate_normal_pass()
-        print(f"Pase normal generado ({command.get('command_id')})")
-    else:
+    # El tipo no viene en el topico: los dos pases llegan por el mismo, el del
+    # dispositivo, y se distinguen solo por este campo.
+    handler = PASS_HANDLERS.get(command.get("type"))
+
+    if handler is None:
         print(f"Comando ignorado: {command.get('type')}")
+        return
+
+    handler()
+    print(f"{command.get('type')} generado ({command.get('command_id')})")
 
 
 client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2)

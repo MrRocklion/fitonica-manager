@@ -5,8 +5,9 @@ acceso.
 
 - `pi_control.py` — clase `piControl`, pulsos de 500 ms sobre GPIO 21 (pase
   normal) y GPIO 20 (pase especial). Relés activos en bajo.
-- `mqtt_example.py` — cliente suscrito al tópico; al recibir `OPEN_ACCESS`
-  genera un pase normal.
+- `mqtt_example.py` — cliente suscrito al tópico; `NORMAL_PASS` genera un pase
+  normal y `ESPECIAL_PASS` uno especial. Ambos comandos llegan por el mismo
+  tópico y se distinguen por el campo `type` del JSON.
 
 ## Requisitos
 
