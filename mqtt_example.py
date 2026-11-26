@@ -28,6 +28,12 @@ PASS_HANDLERS = {
 broker = urlparse(os.environ["PI_MQTT_BROKER_URL"])
 topic = os.environ["PI_MQTT_TOPIC"]
 
+if broker.scheme not in {"mqtt", "mqtts"}:
+    raise ValueError("PI_MQTT_BROKER_URL debe comenzar con mqtt:// o mqtts://")
+
+if not broker.hostname:
+    raise ValueError("PI_MQTT_BROKER_URL no contiene un hostname valido")
+
 
 def on_connect(client, userdata, flags, reason_code, properties):
     if reason_code == 0:
@@ -70,7 +76,15 @@ client.username_pw_set(
     os.environ["PI_MQTT_PASSWORD"],
 )
 
-client.connect(broker.hostname, broker.port or 1883)
+# `mqtts://` habilita TLS con validacion del certificado y del hostname usando
+# las autoridades de confianza instaladas en el sistema. No se desactiva la
+# validacion: las credenciales y los comandos viajan cifrados y se comprueba que
+# el servidor sea realmente el indicado por PI_MQTT_BROKER_URL.
+if broker.scheme == "mqtts":
+    client.tls_set()
+
+default_port = 8883 if broker.scheme == "mqtts" else 1883
+client.connect(broker.hostname, broker.port or default_port)
 
 # Ctrl+C interrumpe el `select()` interno de paho y la excepcion sale de
 # `loop_forever()`. Sin este `try` el usuario ve un traceback y el socket se

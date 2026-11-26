@@ -18,11 +18,16 @@ pip install paho-mqtt python-dotenv gpiozero lgpio
 Un `.env` junto a los scripts:
 
 ```
-PI_MQTT_BROKER_URL=mqtt://broker.ejemplo.com:1883
+PI_MQTT_BROKER_URL=mqtts://broker.ejemplo.com:8883
 PI_MQTT_TOPIC=fitonica/v1/companies/<tenant-uuid>/devices/<device-uuid>/commands
 PI_MQTT_USERNAME=...
 PI_MQTT_PASSWORD=...
 ```
+
+El esquema determina la seguridad y el puerto predeterminado: `mqtts://` activa
+TLS con validacion de certificado y usa el puerto 8883; `mqtt://` usa una
+conexion sin cifrar por el puerto 1883. Para conexiones por Internet se debe
+usar `mqtts://`.
 
 ## Servicio systemd
 
