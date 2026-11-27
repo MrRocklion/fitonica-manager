@@ -7,14 +7,95 @@ import mimetypes
 import os
 import re
 import uuid
+from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 
 class FitonicaError(RuntimeError):
     """Error legible producido al comunicarse con la API de Fitonica."""
+
+
+@dataclass(frozen=True)
+class Membership:
+    """
+    Ventana de vigencia de la membresia, ya como instantes absolutos.
+
+    POR QUE EXISTE ESTE TIPO Y NO SE PASA EL DICCIONARIO CRUDO: los dos extremos
+    acaban escritos en el equipo Hikvision, y el error clasico es arrastrar la
+    cadena ISO hasta el final y recortarle la "Z" para que "parezca" hora local.
+    Aqui se obliga a convertirla en `datetime` consciente de zona una sola vez,
+    en el borde de la API, de modo que mas abajo ya no quede ninguna cadena que
+    malinterpretar.
+
+    `start` y `end` SIEMPRE llevan `tzinfo`: `parse_membership` rechaza una fecha
+    sin zona en lugar de suponerle una.
+    """
+
+    id: int
+    start: datetime
+    end: datetime
+
+
+def parse_instant(value: object, field: str) -> datetime:
+    """
+    Convierte un timestamp ISO de la API en un `datetime` con zona.
+
+    `datetime.fromisoformat` no acepta el sufijo `Z` antes de Python 3.11 y la
+    Raspberry puede ir con 3.9, asi que se traduce a `+00:00` a mano. Una fecha
+    sin zona se RECHAZA: suponerle UTC o la hora local son dos resultados
+    distintos y ninguno de los dos seria una suposicion segura.
+    """
+
+    if not isinstance(value, str) or not value.strip():
+        raise FitonicaError(f"La membresia no trae {field}")
+
+    text = value.strip()
+    if text.endswith(("Z", "z")):
+        text = f"{text[:-1]}+00:00"
+
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError as error:
+        raise FitonicaError(
+            f"{field} de la membresia no es una fecha ISO valida: {value!r}"
+        ) from error
+
+    if parsed.tzinfo is None:
+        raise FitonicaError(f"{field} de la membresia no indica zona horaria: {value!r}")
+
+    return parsed
+
+
+def parse_membership(user: Mapping[str, Any]) -> Membership:
+    """
+    Extrae y valida la membresia vigente que acompana al usuario.
+
+    El backend solo devuelve el usuario cuando tiene UNA membresia vigente, asi
+    que la ausencia del bloque significa que algo cambio en el contrato, no que
+    la persona no pueda entrar. Se trata como error y no como "sin acceso".
+    """
+
+    membership = user.get("membership")
+    if not isinstance(membership, Mapping):
+        raise FitonicaError("La respuesta no incluye la membresia vigente del usuario")
+
+    identifier = membership.get("id")
+    if isinstance(identifier, bool) or not isinstance(identifier, int):
+        raise FitonicaError("La membresia no trae un id valido")
+
+    start = parse_instant(membership.get("start_date"), "start_date")
+    end = parse_instant(membership.get("end_date"), "end_date")
+
+    # Una ventana invertida dejaria el equipo con un `Valid` imposible, que el
+    # firmware acepta sin queja y que no deja entrar a nadie.
+    if end < start:
+        raise FitonicaError("La membresia termina antes de empezar")
+
+    return Membership(id=identifier, start=start, end=end)
 
 
 class Fitonica:
@@ -63,15 +144,50 @@ class Fitonica:
         )
 
     def get_user(self, user_id: int) -> dict[str, Any]:
-        """Obtiene un usuario activo vinculado al establecimiento del equipo."""
+        """
+        Usuario activo del establecimiento del equipo, con su membresia vigente.
+
+        EL ESTABLECIMIENTO NO SE ENVIA. Sale de la credencial del dispositivo en
+        el servidor, asi que esta clase no tiene forma de pedir datos de otra
+        empresa aunque se lo pidieran: no hay parametro donde expresarlo.
+
+        LA MEMBRESIA SE VALIDA AQUI, en el borde de la API, y no mas abajo: si el
+        contrato cambiara, el fallo aparece al obtener el usuario y no a mitad de
+        una escritura en el equipo, con el alta hecha y la vigencia sin poner.
+        """
 
         self._validate_user_id(user_id)
-        return self._api_get(f"/api/devices/access/users/{user_id}")
+        user = self._api_get(f"/api/devices/access/users/{user_id}")
+        # El resultado se descarta: se construye solo para que una membresia
+        # ausente o con fechas imposibles falle ya, antes de tocar el Hikvision.
+        parse_membership(user)
+        return user
 
-    def download_face_id(self, user_id: int) -> Path:
-        """Descarga el Face ID como `UUID_cedula.extension` dentro de `users`."""
+    def download_face_id(self, user_id: int, user: Mapping[str, Any] | None = None) -> Path:
+        """
+        Descarga el Face ID como `UUID_cedula.extension` dentro de `users`.
 
-        user = self.get_user(user_id)
+        `user` EVITA LA SEGUNDA CONSULTA. El nombre del archivo lleva la cedula,
+        que ya venia en la respuesta de `get_user`; sin este parametro el flujo
+        de sincronizacion pediria dos veces los mismos datos al backend y podria
+        encontrarse dos estados distintos entre una llamada y la otra.
+
+        SI SE PASA UN USUARIO DISTINTO AL PEDIDO SE RECHAZA: la imagen se
+        descarga por `user_id` pero se nombra con la cedula de `user`, de modo
+        que un descuido en el sitio de la llamada guardaria el rostro de una
+        persona bajo el documento de otra.
+        """
+
+        self._validate_user_id(user_id)
+
+        if user is None:
+            user = self.get_user(user_id)
+        elif user.get("id") != user_id:
+            raise ValueError(
+                "El usuario recibido no corresponde al user_id solicitado: "
+                f"{user.get('id')!r} != {user_id!r}"
+            )
+
         dni = self._safe_dni(user.get("dni"))
         signed = self._api_get(f"/api/devices/access/users/{user_id}/face-id/url")
         url = signed.get("url")

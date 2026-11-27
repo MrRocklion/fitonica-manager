@@ -1,24 +1,54 @@
-"""Cliente MQTT que solo escucha mensajes."""
+"""Cliente MQTT que escucha los comandos del backend y los ejecuta."""
 
 import json
+import logging
 import os
+from collections import deque
+from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any, Mapping
 from urllib.parse import urlparse
 
 import paho.mqtt.client as mqtt
 from dotenv import load_dotenv
 
-from fitonica import Fitonica, FitonicaError
+from fitonica import Fitonica, FitonicaError, parse_instant, parse_membership
+from hikvision import Hikvision, HikvisionDuplicateUserError, HikvisionError
+from log_setup import setup_logging
 from pi_control import piControl
 
 
 load_dotenv(Path(__file__).resolve().parent / ".env")
+
+# Antes de construir nada: si falta una variable o los GPIO no estan
+# disponibles, el traceback tiene que quedar en el archivo y no solo en un
+# journal que se borra al reiniciar la Pi.
+setup_logging()
+logger = logging.getLogger("main")
 
 # Se construye una sola vez, al arrancar: deja los dos GPIO en alto antes de
 # que llegue el primer mensaje, que es justo lo que evita el chasquido inicial
 # de los reles.
 pi = piControl()
 fitonica = Fitonica.from_env()
+
+# Una sola sesion HTTP contra el equipo para todo el proceso: reutiliza la
+# conexion TCP y evita repetir el reto Digest en cada peticion.
+hikvision = Hikvision.from_env()
+
+# IDENTIFICADORES DE COMANDOS YA COMPLETADOS, para que una reentrega de MQTT no
+# repita el trabajo. QoS 1 garantiza "al menos una vez", asi que el mismo
+# `command_id` puede llegar dos veces.
+#
+# SOLO SE ANOTAN LOS QUE TERMINARON BIEN: si una sincronizacion fallo, la
+# reentrega es una segunda oportunidad y conviene aprovecharla.
+#
+# LIMITACION ACEPTADA: la memoria es del proceso y se pierde al reiniciar el
+# servicio. No se persiste a propósito —seria una base de datos para un caso que
+# el flujo ya tolera—: repetir la sincronizacion es inocuo, porque buscar por
+# `employeeNo` no crea duplicados y `FDSetUp` reemplaza el rostro del mismo
+# `FPID`. El tope evita que la lista crezca sin fin en un servicio de larga vida.
+_COMPLETED_COMMANDS: deque[str] = deque(maxlen=512)
 
 # Cada comando del backend con el rele que le toca. `ESPECIAL_PASS` se escribe
 # asi a proposito: es la ortografia del contrato, no un descuido.
@@ -36,65 +66,269 @@ if broker.scheme not in {"mqtt", "mqtts"}:
 if not broker.hostname:
     raise ValueError("PI_MQTT_BROKER_URL no contiene un hostname valido")
 
+# Queda registrado contra que broker y que dispositivo corre esta instancia:
+# en soporte es lo primero que hay que confirmar. El topico incluye los UID de
+# empresa y dispositivo; la contrasena no se registra nunca.
+logger.info("broker %s://%s", broker.scheme, broker.hostname)
+logger.info("topico %s", topic)
+logger.info("dispositivo %s", os.environ["FITONICA_DEVICE_UID"])
+# La clave del equipo no se registra: solo la URL y el usuario.
+logger.info("hikvision %s (usuario %s, zona %s)", hikvision.api_url, hikvision.user, hikvision.timezone)
+
 
 def on_connect(client, userdata, flags, reason_code, properties):
     if reason_code == 0:
         client.subscribe(topic)
-        print(f"Escuchando: {topic}")
+        logger.info("conectado y escuchando %s", topic)
     else:
-        print(f"Error de conexion: {reason_code}")
+        logger.error("fallo de conexion con el broker: %s", reason_code)
+
+
+def on_disconnect(client, userdata, disconnect_flags, reason_code, properties):
+    # `loop_forever()` reintenta solo, asi que una caida de red no detiene el
+    # servicio y por tanto no deja rastro en systemd. Sin esta linea, un corte
+    # del broker es invisible: el log queda en blanco justo cuando el gimnasio
+    # reporta que los pases dejaron de funcionar.
+    if reason_code == 0:
+        logger.info("desconectado del broker a peticion propia")
+    else:
+        logger.warning("desconexion inesperada (%s); paho reintentara", reason_code)
 
 
 def on_message(client, userdata, message):
+    # paho descarta cualquier excepcion de este callback sin imprimirla: sin
+    # este envoltorio, un comando que rompa el manejador se pierde en silencio
+    # y el log no muestra nada.
+    try:
+        _handle_message(message)
+    except Exception:
+        logger.exception("error no controlado procesando un comando")
+
+
+def _handle_message(message):
     raw = message.payload.decode("utf-8")
-    print(f"{message.topic}: {raw}")
+    logger.info("mensaje recibido en %s: %s", message.topic, raw)
 
     # Un mensaje malformado no debe tumbar el servicio: paho se come la
     # excepcion del callback, pero preferimos verla explicada en el journal.
     try:
         command = json.loads(raw)
     except json.JSONDecodeError:
-        print("Mensaje descartado: no es JSON")
+        logger.warning("mensaje descartado: no es JSON")
+        return
+
+    if not isinstance(command, dict):
+        logger.warning("mensaje descartado: el JSON no es un objeto")
         return
 
     command_type = command.get("type")
 
     # El tipo no viene en el topico: todos los comandos llegan por el mismo, el
     # del dispositivo, y se distinguen solo por este campo.
+    if command_type == "UPDATE_FACE_ID":
+        # NO ACCIONA NINGUN RELE. Es una sincronizacion de datos: la puerta no
+        # se abre porque el backend haya subido una foto nueva.
+        handle_update_face_id(command)
+        return
+
     handler = PASS_HANDLERS.get(command_type)
 
     if handler is None:
-        if command_type == "UPDATE_FACE_ID":
-            user_id = command.get("user_id")
-            if isinstance(user_id, bool) or not isinstance(user_id, int) or user_id <= 0:
-                print(f"UPDATE_FACE_ID descartado: user_id invalido ({user_id!r})")
-                return
-
-            try:
-                image_path = fitonica.download_face_id(user_id)
-            except (FitonicaError, ValueError) as error:
-                print(
-                    f"No se pudo descargar el Face ID del usuario {user_id} "
-                    f"({command.get('command_id')}): {error}"
-                )
-                return
-
-            print(
-                f"Face ID del usuario {user_id} descargado en {image_path} "
-                f"({command.get('command_id')})"
-            )
-            return
-
-        print(f"Comando ignorado: {command_type}")
+        logger.warning("comando ignorado: %s", command_type)
         return
 
     handler()
-    print(f"{command_type} generado ({command.get('command_id')})")
+    logger.info("%s generado (%s)", command_type, command.get("command_id"))
+
+
+def handle_update_face_id(command: Mapping[str, Any]) -> None:
+    """
+    Sincroniza a una persona de Fitonica con el equipo Hikvision.
+
+    LAS FASES VAN EN CASCADA Y NINGUNA EMPIEZA SI LA ANTERIOR FALLO:
+
+        Fitonica -> imagen -> buscar -> (crear | renovar) -> rostro
+
+    Cada fallo se registra y la funcion RETORNA. No se propaga ninguna excepcion
+    al callback de MQTT: una sincronizacion fallida no debe tumbar el servicio ni
+    impedir que el siguiente pase abra la puerta.
+
+    POR QUE IMPORTA EL ORDEN. Si la busqueda falla por un timeout no se intenta
+    el alta: "no se pudo preguntar" y "no existe" son cosas distintas, y
+    confundirlas crea altas duplicadas. Y si falla el alta no se carga el rostro,
+    porque el `FPID` al que asociarlo todavia no existe.
+    """
+
+    command_id = command.get("command_id")
+    user_id = command.get("user_id")
+
+    # ---------------------------------------------------- 1. validar el comando
+    if isinstance(user_id, bool) or not isinstance(user_id, int) or user_id <= 0:
+        logger.warning("UPDATE_FACE_ID descartado: user_id invalido (%r)", user_id)
+        return
+
+    if not isinstance(command_id, str) or not command_id.strip():
+        logger.warning(
+            "UPDATE_FACE_ID descartado: falta command_id (usuario %s)", user_id
+        )
+        return
+
+    tag = f"UPDATE_FACE_ID {command_id}"
+
+    if command_id in _COMPLETED_COMMANDS:
+        logger.info("%s ignorado: ya se sincronizo con exito antes", tag)
+        return
+
+    if _expired(command.get("expires_at"), tag):
+        return
+
+    # ------------------------------------------- 2. usuario y membresia vigente
+    try:
+        user = fitonica.get_user(user_id)
+        membership = parse_membership(user)
+    except (FitonicaError, ValueError) as error:
+        logger.error("%s: no se pudo obtener el usuario %s de Fitonica: %s", tag, user_id, error)
+        return
+
+    # Las dos fechas se muestran ya en la hora del establecimiento, que es la que
+    # acabara escrita en el equipo: en soporte se comparan contra lo que el
+    # aparato ensena en pantalla, no contra UTC.
+    inicio = membership.start.astimezone(hikvision.timezone)
+    fin = membership.end.astimezone(hikvision.timezone)
+    logger.info(
+        "%s: usuario Fitonica %s obtenido; membresia %s vigente hasta %s",
+        tag, user_id, membership.id, fin.strftime("%Y-%m-%d %H:%M"),
+    )
+
+    # ------------------------------------------------- 3. descargar el Face ID
+    try:
+        # Se reutiliza el usuario ya consultado: sin esto el backend recibiria
+        # dos veces la misma peticion por cada sincronizacion.
+        image_path = fitonica.download_face_id(user_id, user=user)
+    except (FitonicaError, ValueError) as error:
+        logger.error("%s: no se pudo descargar el Face ID del usuario %s: %s", tag, user_id, error)
+        return
+
+    logger.info("%s: Face ID descargado en %s", tag, image_path)
+
+    # ------------------------------------- 4. buscar el employeeNo en el equipo
+    try:
+        found = hikvision.find_user(user_id)
+    except HikvisionError as error:
+        # NO se intenta el alta: un fallo tecnico no demuestra que la persona no
+        # este dada de alta, y crear a ciegas provocaria un duplicado.
+        logger.error("%s: fallo la busqueda del employeeNo %s: %s", tag, user_id, error)
+        return
+
+    # ----------------------------------------------- 5. crear o renovar la ficha
+    if found is None:
+        logger.info("%s: employeeNo %s no esta en el equipo; se dara de alta", tag, user_id)
+        try:
+            hikvision.create_user(user, membership)
+        except HikvisionDuplicateUserError as error:
+            # La busqueda dijo que no existia y el equipo dice que si: el estado
+            # no es el que creemos, asi que no se toca el rostro.
+            logger.error(
+                "%s: el equipo rechazo el alta del employeeNo %s por duplicado "
+                "aunque la busqueda no lo encontro: %s",
+                tag, user_id, error,
+            )
+            return
+        except (HikvisionError, ValueError) as error:
+            logger.error("%s: fallo el alta del employeeNo %s: %s", tag, user_id, error)
+            return
+
+        logger.info(
+            "%s: employeeNo %s creado con vigencia %s .. %s (hora local)",
+            tag, user_id,
+            inicio.strftime("%Y-%m-%d %H:%M"), fin.strftime("%Y-%m-%d %H:%M"),
+        )
+        estado = "creado"
+    else:
+        logger.info("%s: employeeNo %s encontrado en Hikvision", tag, user_id)
+
+        # El `beginTime` que el equipo ya tiene, para reenviarlo intacto: la
+        # fecha de inicio NO se recalcula desde Fitonica en una renovacion.
+        begin_time = hikvision.existing_begin_time(found)
+
+        try:
+            hikvision.update_user_end_date(user_id, membership.end, begin_time)
+        except (HikvisionError, ValueError) as error:
+            logger.error("%s: fallo la renovacion del employeeNo %s: %s", tag, user_id, error)
+            return
+
+        logger.info(
+            "%s: fecha final actualizada a %s (hora local); inicio %s conservado",
+            tag, fin.strftime("%Y-%m-%d %H:%M"), begin_time or "sin cambios",
+        )
+        estado = "actualizado"
+
+    # ------------------------------------------------------ 6. cargar el rostro
+    try:
+        hikvision.update_face(user_id, image_path)
+    except (HikvisionError, OSError) as error:
+        # SINCRONIZACION PARCIAL: la ficha quedo escrita y el rostro no. Se dice
+        # explicitamente, porque el equipo ya deja pasar a esta persona por
+        # tarjeta o codigo mientras su cara no esta cargada.
+        logger.error(
+            "%s: SINCRONIZACION PARCIAL del employeeNo %s: el usuario quedo %s "
+            "pero el rostro NO se cargo: %s",
+            tag, user_id, estado, error,
+        )
+        return
+
+    logger.info("%s: rostro actualizado correctamente", tag)
+    logger.info("%s: sincronizacion completa del employeeNo %s (%s)", tag, user_id, estado)
+
+    # Se anota al final: solo un exito completo convierte una reentrega en
+    # trabajo innecesario.
+    _COMPLETED_COMMANDS.append(command_id)
+
+
+def _expired(expires_at: object, tag: str) -> bool:
+    """
+    Descarta una orden caducada antes de tocar ningun servicio.
+
+    EL CONTRATO DA DIEZ SEGUNDOS a todos los comandos, incluido este. Para un
+    pase es una proteccion contra reproducciones; para una sincronizacion es un
+    margen muy justo, porque basta un reintento del broker o una reconexion de la
+    Pi para agotarlo. De ahi que el descarte se registre como advertencia y diga
+    la hora: si aparece a menudo en el log, el problema no es la Raspberry sino
+    el TTL del backend (ver la nota del README).
+
+    Una orden SIN `expires_at` no se descarta: el campo es informativo y su
+    ausencia no es motivo para no sincronizar a alguien.
+    """
+
+    if expires_at is None:
+        return False
+
+    try:
+        limit = parse_instant(expires_at, "expires_at")
+    except FitonicaError as error:
+        logger.warning("%s: expires_at ilegible, se continua (%s)", tag, error)
+        return False
+
+    now = datetime.now(timezone.utc)
+    if now <= limit:
+        return False
+
+    logger.warning(
+        "%s descartado: la orden caduco el %s y ahora son las %s (UTC)",
+        tag, limit.isoformat(timespec="seconds"), now.isoformat(timespec="seconds"),
+    )
+    return True
 
 
 client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2)
 client.on_connect = on_connect
+client.on_disconnect = on_disconnect
 client.on_message = on_message
+
+# paho pasa a registrar sus reintentos y errores de TLS por el mismo archivo.
+# Su detalle fino es de nivel DEBUG, asi que con el nivel INFO habitual solo
+# aparece lo relevante; FITONICA_LOG_LEVEL=DEBUG lo abre entero para soporte.
+client.enable_logger(logging.getLogger("paho.mqtt"))
 
 client.username_pw_set(
     os.environ["PI_MQTT_USERNAME"],
@@ -118,6 +352,8 @@ client.connect(broker.hostname, broker.port or default_port)
 try:
     client.loop_forever()
 except KeyboardInterrupt:
-    print("\nCerrando...")
+    logger.info("parada manual solicitada (SIGINT)")
 finally:
     client.disconnect()
+    hikvision.close()
+    logger.info("fitonica-manager detenido")
