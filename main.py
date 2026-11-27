@@ -8,6 +8,7 @@ from urllib.parse import urlparse
 import paho.mqtt.client as mqtt
 from dotenv import load_dotenv
 
+from fitonica import Fitonica, FitonicaError
 from pi_control import piControl
 
 
@@ -17,6 +18,7 @@ load_dotenv(Path(__file__).resolve().parent / ".env")
 # que llegue el primer mensaje, que es justo lo que evita el chasquido inicial
 # de los reles.
 pi = piControl()
+fitonica = Fitonica.from_env()
 
 # Cada comando del backend con el rele que le toca. `ESPECIAL_PASS` se escribe
 # asi a proposito: es la ortografia del contrato, no un descuido.
@@ -55,16 +57,39 @@ def on_message(client, userdata, message):
         print("Mensaje descartado: no es JSON")
         return
 
-    # El tipo no viene en el topico: los dos pases llegan por el mismo, el del
-    # dispositivo, y se distinguen solo por este campo.
-    handler = PASS_HANDLERS.get(command.get("type"))
+    command_type = command.get("type")
+
+    # El tipo no viene en el topico: todos los comandos llegan por el mismo, el
+    # del dispositivo, y se distinguen solo por este campo.
+    handler = PASS_HANDLERS.get(command_type)
 
     if handler is None:
-        print(f"Comando ignorado: {command.get('type')}")
+        if command_type == "UPDATE_FACE_ID":
+            user_id = command.get("user_id")
+            if isinstance(user_id, bool) or not isinstance(user_id, int) or user_id <= 0:
+                print(f"UPDATE_FACE_ID descartado: user_id invalido ({user_id!r})")
+                return
+
+            try:
+                image_path = fitonica.download_face_id(user_id)
+            except (FitonicaError, ValueError) as error:
+                print(
+                    f"No se pudo descargar el Face ID del usuario {user_id} "
+                    f"({command.get('command_id')}): {error}"
+                )
+                return
+
+            print(
+                f"Face ID del usuario {user_id} descargado en {image_path} "
+                f"({command.get('command_id')})"
+            )
+            return
+
+        print(f"Comando ignorado: {command_type}")
         return
 
     handler()
-    print(f"{command.get('type')} generado ({command.get('command_id')})")
+    print(f"{command_type} generado ({command.get('command_id')})")
 
 
 client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2)
