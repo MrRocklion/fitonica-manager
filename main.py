@@ -12,6 +12,7 @@ from urllib.parse import urlparse
 import paho.mqtt.client as mqtt
 from dotenv import load_dotenv
 
+from face_image import FaceImageError
 from fitonica import Fitonica, FitonicaError, parse_instant, parse_membership
 from hikvision import Hikvision, HikvisionDuplicateUserError, HikvisionError
 from log_setup import setup_logging
@@ -266,7 +267,7 @@ def handle_update_face_id(command: Mapping[str, Any]) -> None:
     # ------------------------------------------------------ 6. cargar el rostro
     try:
         hikvision.update_face(user_id, image_path)
-    except (HikvisionError, OSError) as error:
+    except (HikvisionError, FaceImageError, OSError) as error:
         # SINCRONIZACION PARCIAL: la ficha quedo escrita y el rostro no. Se dice
         # explicitamente, porque el equipo ya deja pasar a esta persona por
         # tarjeta o codigo mientras su cara no esta cargada.

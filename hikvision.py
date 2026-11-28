@@ -30,7 +30,6 @@ from __future__ import annotations
 
 import json
 import logging
-import mimetypes
 import os
 import uuid
 from datetime import datetime
@@ -41,6 +40,7 @@ from zoneinfo import ZoneInfo
 import requests
 from requests.auth import HTTPDigestAuth
 
+from face_image import ensure_device_jpeg
 from fitonica import Membership
 
 logger = logging.getLogger(__name__)
@@ -457,6 +457,12 @@ class Hikvision:
         devolvio el almacenamiento. Inventar la ruta aqui es exactamente como se
         rompio antes.
 
+        SIEMPRE SE SUBE JPEG. El backend guarda la foto en el formato que subio
+        la app —en la practica WebP— y la libreria facial solo acepta JPEG, asi
+        que `ensure_device_jpeg` convierte lo que haga falta antes de enviar. La
+        conversion vive fuera de esta clase porque depende de Pillow y el resto
+        del cliente no tiene por que arrastrar esa dependencia.
+
         EL ARCHIVO SE CIERRA SIEMPRE, incluso si el equipo rechaza la carga o no
         responde: el `with` envuelve la peticion completa. Un servicio de larga
         vida que filtra un descriptor por sincronizacion acaba sin descriptores.
@@ -467,15 +473,15 @@ class Hikvision:
         if not image_path.is_file():
             raise HikvisionError(f"la imagen {image_path} no existe")
 
-        # El tipo real del archivo, no un "image/jpeg" fijo: la imagen puede
-        # haber llegado del storage como PNG o WebP.
-        content_type = mimetypes.guess_type(image_path.name)[0] or "application/octet-stream"
+        # Devuelve la misma ruta si ya era un JPEG admisible; si no, un derivado
+        # `.device.jpg` junto al original, que no se modifica.
+        upload_path = ensure_device_jpeg(image_path)
 
         record = json.dumps(
             {"faceLibType": FACE_LIB_TYPE, "FDID": FACE_LIB_ID, "FPID": employee_no}
         )
 
-        with image_path.open("rb") as image:
+        with upload_path.open("rb") as image:
             self._request(
                 "PUT",
                 "/ISAPI/Intelligent/FDLib/FDSetUp?format=json",
@@ -483,7 +489,8 @@ class Hikvision:
                 # `FaceDataRecord` viaja como campo de formulario con el JSON ya
                 # serializado: el equipo espera multipart, no un cuerpo JSON.
                 data={"FaceDataRecord": record},
-                files={"img": (image_path.name, image, content_type)},
+                # El contenedor ya esta garantizado por `ensure_device_jpeg`.
+                files={"img": (upload_path.name, image, "image/jpeg")},
             )
 
     # ------------------------------------------------------------- Transporte

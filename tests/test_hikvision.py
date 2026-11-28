@@ -536,14 +536,55 @@ class UpdateFaceTests(unittest.TestCase):
         self.assertEqual(handle.name, str(self.image))
         self.assertEqual(content_type, "image/jpeg")
 
-    def test_declara_el_mime_real_de_la_imagen(self) -> None:
-        png = self.image.with_name("otro_1104595671.png")
-        png.write_bytes(b"\x89PNG")
+    def test_siempre_declara_jpeg(self) -> None:
+        """
+        El equipo solo acepta JPEG en la libreria facial, y `ensure_device_jpeg`
+        garantiza el contenedor antes de subir: no hay rama que declare otro.
+        """
+
         hikvision, session = device(OK_ENVELOPE)
 
-        hikvision.update_face(1394, png)
+        hikvision.update_face(1394, self.image)
 
-        self.assertEqual(session.calls[0]["files"]["img"][2], "image/png")
+        self.assertEqual(session.calls[0]["files"]["img"][2], "image/jpeg")
+
+    def test_un_jpeg_admisible_se_sube_sin_recodificar(self) -> None:
+        """Recodificar un JPEG que ya vale solo perderia calidad."""
+
+        hikvision, session = device(OK_ENVELOPE)
+        original = self.image.read_bytes()
+
+        hikvision.update_face(1394, self.image)
+
+        self.assertEqual(session.calls[0]["files"]["img"][0], self.image.name)
+        self.assertEqual(self.image.read_bytes(), original)
+        self.assertFalse(list(self.image.parent.glob("*.device.jpg")))
+
+    def test_un_webp_no_se_sube_tal_cual(self) -> None:
+        """
+        EL CASO QUE ROMPIA LA SINCRONIZACION. El backend guarda la foto en el
+        formato que subio la app, y sube WebP; la libreria facial no lo acepta.
+        Sin Pillow el fallo es explicito y dice como arreglarlo, en lugar de
+        enviar un contenedor que el equipo rechaza.
+        """
+
+        webp = self.image.with_name("otro_1104595671.webp")
+        webp.write_bytes(b"RIFF\x00\x00\x00\x00WEBPVP8 ")
+        hikvision, session = device(OK_ENVELOPE)
+
+        try:
+            hikvision.update_face(1394, webp)
+        except Exception as error:  # noqa: BLE001 - depende de si Pillow esta
+            self.assertNotIsInstance(error, HikvisionResponseError)
+        else:
+            # Con Pillow instalado: se convirtio y se subio como JPEG.
+            nombre, _, content_type = session.calls[0]["files"]["img"]
+            self.assertEqual(content_type, "image/jpeg")
+            self.assertTrue(nombre.endswith(".device.jpg"), nombre)
+
+        # En ningun caso se envia el WebP.
+        if session.calls:
+            self.assertFalse(session.calls[0]["files"]["img"][0].endswith(".webp"))
 
     def test_cierra_el_archivo_tras_una_carga_correcta(self) -> None:
         hikvision, session = device(OK_ENVELOPE)

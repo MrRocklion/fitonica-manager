@@ -12,6 +12,8 @@ acceso.
   de alta, renueva la vigencia y carga el rostro.
 - `fitonica.py` — cliente de la API del backend, autenticado con la credencial
   del dispositivo.
+- `face_image.py` — convierte la foto descargada al JPEG que exige la librería
+  facial.
 - `log_setup.py` — registro en `logs/fitonica-manager.log`, con rotación y
   copia en el journal.
 - `tests/` — pruebas sin hardware ni equipo real.
@@ -19,10 +21,13 @@ acceso.
 ## Requisitos
 
 ```bash
-pip install paho-mqtt python-dotenv gpiozero lgpio requests
+pip install paho-mqtt python-dotenv gpiozero lgpio requests pillow
 ```
 
 `requests` lo usa `hikvision.py` para hablar ISAPI con Digest Authentication.
+`pillow` lo usa `face_image.py` para convertir la foto a JPEG: **sin él el
+servicio arranca igual** (el import es perezoso), pero toda sincronización de
+rostro falla con un mensaje que lo dice.
 
 Un `.env` junto a los scripts:
 
@@ -151,12 +156,52 @@ quitarle la «Z» y escribirla tal cual dejaría al equipo cerrando la vigencia 
 | `/ISAPI/AccessControl/UserInfo/Search?format=json` | POST | búsqueda exacta por `employeeNo` |
 | `/ISAPI/AccessControl/UserInfo/Record?format=json` | POST | alta |
 | `/ISAPI/AccessControl/UserInfo/Modify?format=json` | PUT | renovación de `Valid.endTime` |
-| `/ISAPI/Intelligent/FDLib/FDSetUp?format=json` | PUT | alta y reemplazo del rostro (multipart) |
+| `/ISAPI/Intelligent/FDLib/FDSetUp?format=json` | PUT | alta y reemplazo del rostro (multipart JPEG) |
 
 Todas con Digest Authentication sobre una única `requests.Session`, con timeout
 y con los errores clasificados en `HikvisionCommunicationError` (timeout, red) y
 `HikvisionResponseError` (HTTP de error, JSON inválido, rechazo de ISAPI).
 `HikvisionDuplicateUserError` distingue el `employeeNoAlreadyExist`.
+
+### Formato de la imagen: WebP → JPEG
+
+El backend guarda la foto de Face ID **en el formato en que la subió la app**
+—admite JPG, PNG, WEBP y AVIF— y en la práctica sube **WebP**:
+
+```
+users/76f7fb74-9688-4131-906d-e11e1fec801c_1150852901.webp
+users/cfab12ff-2e2b-47d2-8c50-7278588d8f57_1721360921.webp
+```
+
+La librería facial de Hikvision **solo acepta JPEG**, así que subir el WebP tal
+cual termina siempre igual: usuario creado, vigencia puesta y rostro rechazado.
+Por eso `update_face` pasa la imagen por `ensure_device_jpeg` antes de enviarla.
+
+Qué hace esa conversión:
+
+- **Un JPEG que ya cumple el límite se envía tal cual.** Recodificarlo solo
+  perdería calidad.
+- **Todo lo demás se transcodifica** —WebP, PNG, AVIF, o un JPEG demasiado
+  grande— a `<nombre>.device.jpg`, **junto al original, que no se modifica**. En
+  `users/` queda la pareja y en soporte se puede comparar lo que llegó del
+  backend con lo que se envió al equipo.
+- **Aplica el EXIF de orientación** antes de guardar. Una foto tomada con el
+  móvil de lado lleva la rotación en los metadatos, no en los píxeles, y el JPEG
+  se guarda sin EXIF: sin esto el rostro llegaría girado y la detección fallaría
+  sin que nada pareciera mal.
+- **Aplana la transparencia sobre blanco.** WebP y PNG la admiten y JPEG no; sin
+  aplanar, esas zonas saldrían negras.
+- **JPEG baseline, no progresivo.** Varios firmwares de esta familia no
+  decodifican JPEG progresivo y el rechazo no dice por qué.
+- **Reduce a 1080 px de lado máximo** y baja la calidad por pasos (92 → 55)
+  hasta entrar en **200 KB**, el mismo tope que `FACE_ID_MAX_SIZE_BYTES` del
+  backend. Nunca amplía una imagen pequeña; si mide menos de 60 px avisa en el
+  log sin abortar, porque el equipo es quien decide si le sirve.
+
+**Arreglo de fondo recomendado, fuera de esta tarea:** que el backend genere la
+representación JPEG al subir la foto, una vez, en lugar de que cada Raspberry la
+convierta en cada sincronización. Requiere procesamiento de imagen en el backend
+(`sharp`) y migrar las imágenes ya guardadas, así que queda como propuesta.
 
 ### Idempotencia
 
@@ -227,8 +272,12 @@ python3 -m unittest discover -s tests -t .
 ```
 
 ```bash
-python3 -m py_compile main.py fitonica.py hikvision.py log_setup.py pi_control.py
+python3 -m py_compile main.py fitonica.py hikvision.py face_image.py log_setup.py pi_control.py
 ```
+
+Las pruebas que decodifican imágenes de verdad se **omiten** si Pillow no está
+instalado, de modo que la suite pasa en una máquina de desarrollo sin la
+dependencia y se ejecuta completa en la Raspberry.
 
 ## Servicio systemd
 
