@@ -217,13 +217,43 @@ class Fitonica:
         destination.write_bytes(content)
         return destination
 
+    def confirm_face_id_synced(self, user_id: int) -> dict[str, Any]:
+        """
+        Avisa al backend de que el rostro ya quedo cargado en el equipo.
+
+        El backend marca entonces la membresia vigente como `SUBIDO`, y el
+        mostrador deja de verla como `PENDIENTE`.
+
+        SOLO SE LLAMA CUANDO TODO EL PROCESO SALIO BIEN. Marcar `SUBIDO` con el
+        rostro a medio cargar le diria al gimnasio que la persona ya puede entrar
+        por reconocimiento facial cuando no es verdad.
+
+        NO ENVIA CUERPO. Ni el estado ni la membresia los elige el dispositivo:
+        el backend resuelve cual es la membresia vigente —la misma que entrego en
+        `get_user`— y el unico estado que esta ruta escribe es `SUBIDO`. Asi esta
+        credencial no sirve para marcar `ERROR` en las membresias del gimnasio ni
+        para tocar la de otra persona.
+        """
+
+        self._validate_user_id(user_id)
+        return self._api_request(
+            f"/api/devices/access/users/{user_id}/face-id/synced", method="POST"
+        )
+
     def _api_get(self, path: str) -> dict[str, Any]:
+        return self._api_request(path)
+
+    def _api_request(self, path: str, method: str = "GET") -> dict[str, Any]:
         request = Request(
             f"{self.api_url}{path}",
+            # Cuerpo vacio en el POST: urllib exige `data` para no enviar la
+            # peticion sin `Content-Length`, que algunos proxys rechazan.
+            data=b"" if method != "GET" else None,
             headers={
                 "Accept": "application/json",
                 "x-device-api-key": self._device_api_key,
             },
+            method=method,
         )
         try:
             with urlopen(request, timeout=self.timeout) as response:

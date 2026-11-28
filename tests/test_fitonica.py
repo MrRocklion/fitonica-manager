@@ -84,6 +84,8 @@ class FitonicaTestCase(unittest.TestCase):
         )
         #: Cada `urlopen` recibido: (url, cabeceras).
         self.requests: list[tuple[str, dict]] = []
+        #: Metodo HTTP y cuerpo de cada peticion, por indice.
+        self.verbs: list[tuple[str, object]] = []
 
     def tearDown(self) -> None:
         self._tmp.cleanup()
@@ -93,6 +95,7 @@ class FitonicaTestCase(unittest.TestCase):
 
         def opener(request, timeout=None):  # noqa: ANN001 - firma de urllib
             self.requests.append((request.full_url, dict(request.headers)))
+            self.verbs.append((request.get_method(), request.data))
             for suffix, response in routes.items():
                 if request.full_url.endswith(suffix):
                     return response
@@ -277,3 +280,77 @@ class DownloadFaceIdTests(FitonicaTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ConfirmFaceIdSyncedTests(FitonicaTestCase):
+    """
+    Confirmación de la carga del rostro.
+
+    Es la única llamada del dispositivo que ESCRIBE en la base de datos, así que
+    lo que se congela aquí es cuán estrecha es: un POST sin cuerpo, a una ruta
+    que sólo admite el id del usuario.
+    """
+
+    RESPUESTA = {"user_id": 1394, "membership_id": 123, "face_status": "SUBIDO"}
+
+    def test_confirma_y_devuelve_el_estado_escrito(self) -> None:
+        with self.fake_urlopen({"/face-id/synced": self.envelope(self.RESPUESTA)}):
+            resultado = self.client.confirm_face_id_synced(1394)
+
+        self.assertEqual(resultado, self.RESPUESTA)
+
+    def test_usa_POST_contra_la_ruta_del_usuario(self) -> None:
+        with self.fake_urlopen({"/face-id/synced": self.envelope(self.RESPUESTA)}):
+            self.client.confirm_face_id_synced(1394)
+
+        url, _ = self.requests[0]
+        metodo, cuerpo = self.verbs[0]
+        self.assertTrue(url.endswith("/api/devices/access/users/1394/face-id/synced"))
+        self.assertEqual(metodo, "POST")
+        # Cuerpo vacio: el backend no acepta ningun campo en esta ruta.
+        self.assertEqual(cuerpo, b"")
+
+    def test_las_consultas_siguen_siendo_GET(self) -> None:
+        with self.fake_urlopen({"/users/1394": self.envelope(user_payload())}):
+            self.client.get_user(1394)
+
+        metodo, cuerpo = self.verbs[0]
+        self.assertEqual(metodo, "GET")
+        self.assertIsNone(cuerpo)
+
+    def test_envia_la_credencial_del_dispositivo(self) -> None:
+        with self.fake_urlopen({"/face-id/synced": self.envelope(self.RESPUESTA)}):
+            self.client.confirm_face_id_synced(1394)
+
+        _, headers = self.requests[0]
+        self.assertEqual(headers.get("X-device-api-key"), API_KEY)
+
+    def test_no_hay_donde_colar_un_estado_ni_otra_membresia(self) -> None:
+        """
+        La firma solo acepta `user_id`. Si aceptara un `face_status`, esta
+        credencial serviria para marcar ERROR en las membresias del gimnasio.
+        """
+
+        import inspect
+
+        firma = inspect.signature(self.client.confirm_face_id_synced)
+
+        self.assertEqual(list(firma.parameters), ["user_id"])
+
+    def test_rechaza_un_user_id_invalido_sin_llamar_a_la_api(self) -> None:
+        for invalido in (0, -5, True, "1394"):
+            with self.subTest(user_id=invalido):
+                with self.assertRaises(ValueError):
+                    self.client.confirm_face_id_synced(invalido)
+
+        self.assertEqual(self.requests, [])
+
+    def test_un_error_de_la_api_se_propaga_como_FitonicaError(self) -> None:
+        def opener(request, timeout=None):  # noqa: ANN001
+            from urllib.error import HTTPError
+
+            raise HTTPError(request.full_url, 503, "Service Unavailable", {}, None)
+
+        with patch.object(fitonica, "urlopen", opener):
+            with self.assertRaises(FitonicaError):
+                self.client.confirm_face_id_synced(1394)

@@ -279,6 +279,26 @@ def handle_update_face_id(command: Mapping[str, Any]) -> None:
         return
 
     logger.info("%s: rostro actualizado correctamente", tag)
+
+    # ------------------------------------- 7. marcar face_status en el backend
+    try:
+        confirmacion = fitonica.confirm_face_id_synced(user_id)
+    except (FitonicaError, ValueError) as error:
+        # El equipo quedo bien; lo que fallo es el registro. No se dice
+        # "sincronizacion completa" porque el mostrador seguira viendo la
+        # membresia como PENDIENTE y alguien va a preguntar por que.
+        logger.error(
+            "%s: el rostro quedo cargado en el equipo pero NO se pudo marcar "
+            "face_status de la membresia %s: %s",
+            tag, membership.id, error,
+        )
+        return
+
+    logger.info(
+        "%s: face_status de la membresia %s marcado como %s",
+        tag, confirmacion.get("membership_id", membership.id),
+        confirmacion.get("face_status", "SUBIDO"),
+    )
     logger.info("%s: sincronizacion completa del employeeNo %s (%s)", tag, user_id, estado)
 
     # Se anota al final: solo un exito completo convierte una reentrega en

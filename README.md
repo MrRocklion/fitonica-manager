@@ -102,11 +102,39 @@ anterior falló:
 5a. si NO existe          POST /ISAPI/AccessControl/UserInfo/Record  (vigencia completa)
 5b. si YA existe          PUT  /ISAPI/AccessControl/UserInfo/Modify  (solo endTime)
 6. rostro                 PUT  /ISAPI/Intelligent/FDLib/FDSetUp
+7. marcar face_status     POST /api/devices/access/users/:id/face-id/synced
 ```
 
 Un fallo en cualquier punto se registra y **el servicio MQTT sigue en pie**: los
 pases se siguen atendiendo. `UPDATE_FACE_ID` **no acciona ningún relé**: que el
 backend suba una foto nueva no abre la puerta.
+
+### `face_status` de la membresía
+
+El paso 7 marca la membresía vigente como `SUBIDO`, de modo que el mostrador
+deja de verla como `PENDIENTE`. Sólo se llama **cuando los seis pasos
+anteriores salieron bien**: marcarla con el rostro a medio cargar le diría al
+gimnasio que la persona ya entra por reconocimiento facial cuando no es cierto.
+
+La ruta es **autenticada por dispositivo y sin cuerpo**, a propósito:
+
+- El dispositivo **no elige el estado**. El único que esta ruta escribe es
+  `SUBIDO`; si aceptara un `face_status`, un lector comprometido podría marcar
+  `ERROR` en las membresías del gimnasio.
+- El dispositivo **no elige la membresía**. El backend resuelve la vigente con el
+  mismo desempate determinista que `GET users/:userId`, así que el estado cae
+  sobre aquella cuyas fechas el equipo acaba de escribir.
+- **Sólo se escribe `face_status`.** Las fechas, la duración, los accesos y el
+  `status` de la membresía no se pueden tocar desde aquí.
+- **Es idempotente:** marcar `SUBIDO` dos veces deja el mismo estado.
+
+Si el equipo quedó bien pero la marca falla, el log lo dice y **no** declara
+«sincronización completa»: alguien va a preguntar por qué el mostrador sigue
+mostrando `PENDIENTE`, y la respuesta tiene que estar en el archivo.
+
+**Nota de alcance:** sólo se informa del éxito. Reportar `ERROR` desde el
+dispositivo sería útil para el mostrador, pero ampliaría lo que una credencial de
+lector puede escribir, así que queda como propuesta.
 
 ### Identidad de la persona en el equipo
 
@@ -158,7 +186,9 @@ quitarle la «Z» y escribirla tal cual dejaría al equipo cerrando la vigencia 
 | `/ISAPI/AccessControl/UserInfo/Modify?format=json` | PUT | renovación de `Valid.endTime` |
 | `/ISAPI/Intelligent/FDLib/FDSetUp?format=json` | PUT | alta y reemplazo del rostro (multipart JPEG) |
 
-Todas con Digest Authentication sobre una única `requests.Session`, con timeout
+La confirmación del paso 7 va contra el backend, no contra el equipo.
+
+Las de ISAPI, todas con Digest Authentication sobre una única `requests.Session`, con timeout
 y con los errores clasificados en `HikvisionCommunicationError` (timeout, red) y
 `HikvisionResponseError` (HTTP de error, JSON inválido, rechazo de ISAPI).
 `HikvisionDuplicateUserError` distingue el `employeeNoAlreadyExist`.

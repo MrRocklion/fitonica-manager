@@ -95,10 +95,18 @@ def command(**overrides: object) -> dict:
 class FakeFitonica:
     """Doble de la API: apunta las llamadas y permite inyectar fallos."""
 
-    def __init__(self, user: dict | None = None, *, fail_user=None, fail_image=None) -> None:
+    def __init__(
+        self,
+        user: dict | None = None,
+        *,
+        fail_user=None,
+        fail_image=None,
+        fail_confirm=None,
+    ) -> None:
         self.user = user if user is not None else dict(USER)
         self.fail_user = fail_user
         self.fail_image = fail_image
+        self.fail_confirm = fail_confirm
         self.calls: list[tuple] = []
 
     def get_user(self, user_id: int) -> dict:
@@ -112,6 +120,12 @@ class FakeFitonica:
         if self.fail_image:
             raise self.fail_image
         return IMAGE
+
+    def confirm_face_id_synced(self, user_id: int) -> dict:
+        self.calls.append(("confirm_face_id_synced", user_id))
+        if self.fail_confirm:
+            raise self.fail_confirm
+        return {"user_id": user_id, "membership_id": 123, "face_status": "SUBIDO"}
 
 
 class FakeHikvision:
@@ -255,7 +269,9 @@ class NewUserFlowTests(MainTestCase):
             main.on_message(None, None, message(command()))
 
         self.assertEqual(self.names(equipo), ["find_user", "create_user", "update_face"])
-        self.assertEqual(self.names(api), ["get_user", "download_face_id"])
+        self.assertEqual(
+            self.names(api), ["get_user", "download_face_id", "confirm_face_id_synced"]
+        )
 
     def test_el_alta_recibe_la_vigencia_completa(self) -> None:
         """25/34. Inicio y final de la membresia vigente."""
@@ -592,3 +608,118 @@ class WiringTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class FaceStatusTests(MainTestCase):
+    """
+    Paso 7: marcar `face_status` en la membresía.
+
+    LO QUE PROTEGE. El mostrador usa ese campo para saber si una persona ya puede
+    entrar por reconocimiento facial. Marcarlo antes de tiempo —o con el rostro a
+    medio cargar— le diría al gimnasio algo que no es verdad.
+    """
+
+    def test_se_marca_al_terminar_todo_el_proceso(self) -> None:
+        api, equipo = FakeFitonica(), FakeHikvision(found=None)
+        self.wire(api, equipo)
+
+        with self.assertLogs("main", level="INFO") as registro:
+            main.on_message(None, None, message(command()))
+
+        self.assertIn(("confirm_face_id_synced", 1394), api.calls)
+        salida = "\n".join(registro.output)
+        self.assertIn("face_status de la membresia 123 marcado como SUBIDO", salida)
+        self.assertIn("sincronizacion completa", salida)
+
+    def test_se_marca_despues_del_rostro_y_no_antes(self) -> None:
+        """El orden es la garantía: primero el equipo, luego el registro."""
+
+        api, equipo = FakeFitonica(), FakeHikvision(found=None)
+        self.wire(api, equipo)
+
+        with self.assertLogs("main", level="INFO"):
+            main.on_message(None, None, message(command()))
+
+        self.assertEqual(self.names(api)[-1], "confirm_face_id_synced")
+        self.assertEqual(self.names(equipo)[-1], "update_face")
+
+    def test_tambien_se_marca_al_renovar_a_un_usuario_existente(self) -> None:
+        api = FakeFitonica()
+        equipo = FakeHikvision(found={"employeeNo": "1394", "Valid": {"beginTime": "2025-03-15T08:30:00"}})
+        self.wire(api, equipo)
+
+        with self.assertLogs("main", level="INFO"):
+            main.on_message(None, None, message(command()))
+
+        self.assertIn(("confirm_face_id_synced", 1394), api.calls)
+
+    def test_no_se_marca_si_falla_el_rostro(self) -> None:
+        api = FakeFitonica()
+        equipo = FakeHikvision(found=None, update_face=HikvisionError("imagen rechazada"))
+        self.wire(api, equipo)
+
+        with self.assertLogs("main", level="ERROR"):
+            main.on_message(None, None, message(command()))
+
+        self.assertNotIn("confirm_face_id_synced", self.names(api))
+
+    def test_no_se_marca_si_falla_el_alta(self) -> None:
+        api = FakeFitonica()
+        equipo = FakeHikvision(found=None, create_user=HikvisionError("rechazado"))
+        self.wire(api, equipo)
+
+        with self.assertLogs("main", level="ERROR"):
+            main.on_message(None, None, message(command()))
+
+        self.assertNotIn("confirm_face_id_synced", self.names(api))
+
+    def test_no_se_marca_si_falla_la_busqueda(self) -> None:
+        api = FakeFitonica()
+        equipo = FakeHikvision(find_user=HikvisionCommunicationError("sin respuesta"))
+        self.wire(api, equipo)
+
+        with self.assertLogs("main", level="ERROR"):
+            main.on_message(None, None, message(command()))
+
+        self.assertNotIn("confirm_face_id_synced", self.names(api))
+
+    def test_si_falla_la_marca_no_se_declara_sincronizacion_completa(self) -> None:
+        """
+        El equipo quedó bien y el registro no. Decir "completa" dejaría una
+        membresía en PENDIENTE sin que nada en el log lo explique.
+        """
+
+        api = FakeFitonica(fail_confirm=FitonicaError("La API respondio HTTP 503"))
+        equipo = FakeHikvision(found=None)
+        self.wire(api, equipo)
+
+        with self.assertLogs("main", level="ERROR") as registro:
+            main.on_message(None, None, message(command()))
+
+        salida = "\n".join(registro.output)
+        self.assertIn("el rostro quedo cargado en el equipo pero NO se pudo marcar", salida)
+        self.assertIn("membresia 123", salida)
+        self.assertNotIn("sincronizacion completa", salida)
+
+    def test_un_fallo_al_marcar_deja_el_comando_reintentable(self) -> None:
+        """Solo un éxito completo convierte una reentrega en trabajo innecesario."""
+
+        api = FakeFitonica(fail_confirm=FitonicaError("HTTP 503"))
+        equipo = FakeHikvision(found=None)
+        self.wire(api, equipo)
+
+        with self.assertLogs("main", level="ERROR"):
+            main.on_message(None, None, message(command()))
+            main.on_message(None, None, message(command()))
+
+        self.assertEqual(self.names(api).count("confirm_face_id_synced"), 2)
+
+    def test_una_reentrega_tras_el_exito_no_vuelve_a_marcar(self) -> None:
+        api, equipo = FakeFitonica(), FakeHikvision(found=None)
+        self.wire(api, equipo)
+
+        with self.assertLogs("main", level="INFO"):
+            main.on_message(None, None, message(command()))
+            main.on_message(None, None, message(command()))
+
+        self.assertEqual(self.names(api).count("confirm_face_id_synced"), 1)
