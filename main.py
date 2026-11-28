@@ -14,7 +14,12 @@ from dotenv import load_dotenv
 
 from face_image import FaceImageError
 from fitonica import Fitonica, FitonicaError, parse_instant, parse_membership
-from hikvision import Hikvision, HikvisionDuplicateUserError, HikvisionError
+from hikvision import (
+    AccessWindow,
+    Hikvision,
+    HikvisionDuplicateUserError,
+    HikvisionError,
+)
 from log_setup import setup_logging
 from pi_control import piControl
 
@@ -138,6 +143,16 @@ def _handle_message(message):
         handle_sync_user_access(command)
         return
 
+    if command_type == "UPDATE_STAFF_FACE_ID":
+        # Personal, no cliente: tampoco acciona ningun rele.
+        handle_update_staff_face_id(command)
+        return
+
+    if command_type == "DELETE_STAFF_MEMBER":
+        # Retira una ficha del equipo. Nunca abre nada.
+        handle_delete_staff_member(command)
+        return
+
     handler = PASS_HANDLERS.get(command_type)
 
     if handler is None:
@@ -215,7 +230,9 @@ def handle_update_face_id(command: Mapping[str, Any]) -> None:
     if found is None:
         logger.info("%s: employeeNo %s no esta en el equipo; se dara de alta", tag, user_id)
         try:
-            hikvision.create_user(user, membership)
+            hikvision.create_user(
+                user, AccessWindow(start=membership.start, end=membership.end)
+            )
         except HikvisionDuplicateUserError as error:
             # La busqueda dijo que no existia y el equipo dice que si: el estado
             # no es el que creemos, asi que no se toca el rostro.
@@ -385,6 +402,255 @@ def handle_sync_user_access(command: Mapping[str, Any]) -> None:
 
     # Solo tras escribir de verdad en el equipo.
     _COMPLETED_COMMANDS.append(command_id)
+
+
+# ══════════════════════════════════════════════════════════════ PERSONAL
+#
+# El personal no tiene membresia: su vigencia en el equipo no sale de una venta
+# sino de pertenecer a la plantilla. De ahi la ventana larga y fija de abajo.
+
+#: Fin de la vigencia del personal en el equipo.
+#:
+#: POR QUE UNA FECHA FIJA Y NO «SIN CADUCIDAD»: `Valid` es obligatorio y el
+#: firmware solo admite fechas entre 2000 y 2037 (ver `VALID_RANGE_END`). 2035
+#: queda holgadamente dentro y es lo bastante lejano como para que nadie se
+#: quede fuera por olvido; quien deja la plantilla se retira con
+#: `DELETE_STAFF_MEMBER`, no esperando a que «venza».
+STAFF_ACCESS_END = (2035, 12, 31, 23, 59, 59)
+
+
+def _staff_access_window() -> AccessWindow:
+    """
+    Ventana de acceso del personal, en la zona horaria del establecimiento.
+
+    EL INICIO ES HOY A LAS 00:00 y no «ahora»: con la hora exacta del alta,
+    alguien dado de alta a las 10:00 no habria podido entrar esa misma manana si
+    el equipo compara contra el inicio del dia.
+    """
+
+    zona = hikvision.timezone
+    hoy = datetime.now(zona).replace(hour=0, minute=0, second=0, microsecond=0)
+    fin = datetime(*STAFF_ACCESS_END, tzinfo=zona)
+
+    return AccessWindow(start=hoy, end=fin)
+
+
+def handle_update_staff_face_id(command: Mapping[str, Any]) -> None:
+    """
+    Da de alta —o pone al dia— a un miembro del PERSONAL en el equipo.
+
+    EN QUE SE DIFERENCIA DE `UPDATE_FACE_ID`, que hace algo muy parecido para
+    clientes:
+
+        UPDATE_FACE_ID        vigencia = fechas de la membresia vendida
+        UPDATE_STAFF_FACE_ID  vigencia = hoy 00:00 .. 2035-12-31 23:59:59
+
+    Y los datos salen de rutas distintas: `get_staff_user` consulta
+    `staff_membership`, porque un recepcionista puede no haber comprado nunca un
+    plan y `get_user` le responderia 404.
+
+    LAS FASES VAN EN CASCADA y ninguna empieza si la anterior fallo. No se
+    propaga ninguna excepcion al callback de MQTT.
+
+    NO ACCIONA NINGUN RELE.
+    """
+
+    # ---------------------------------------------------- 1. validar el comando
+    accepted = _accept_user_command(command, "UPDATE_STAFF_FACE_ID")
+    if accepted is None:
+        return
+
+    user_id, command_id, tag = accepted
+
+    # ----------------------------------------------- 2. datos del personal
+    try:
+        user = fitonica.get_staff_user(user_id)
+    except (FitonicaError, ValueError) as error:
+        logger.error("%s: no se pudo obtener al personal %s de Fitonica: %s", tag, user_id, error)
+        return
+
+    logger.info("%s: miembro del personal %s obtenido", tag, user_id)
+
+    # ------------------------------------------------- 3. descargar el rostro
+    try:
+        # Se reutiliza el usuario ya consultado: sin esto el backend recibiria
+        # dos veces la misma peticion por cada sincronizacion.
+        image_path = fitonica.download_staff_face_id(user_id, user=user)
+    except (FitonicaError, ValueError) as error:
+        logger.error("%s: no se pudo descargar el rostro de %s: %s", tag, user_id, error)
+        return
+
+    logger.info("%s: rostro descargado en %s", tag, image_path)
+
+    # ------------------------------------- 4. buscar el employeeNo en el equipo
+    try:
+        found = hikvision.find_user(user_id)
+    except HikvisionError as error:
+        # «No se pudo preguntar» NO es «no existe»: crear a ciegas duplicaria.
+        logger.error("%s: fallo la busqueda del employeeNo %s: %s", tag, user_id, error)
+        return
+
+    window = _staff_access_window()
+    inicio = window.start.strftime("%Y-%m-%d %H:%M:%S")
+    fin = window.end.strftime("%Y-%m-%d %H:%M:%S")
+
+    # ----------------------------------------------- 5. crear o renovar la ficha
+    if found is None:
+        logger.info("%s: employeeNo %s no esta en el equipo; se dara de alta", tag, user_id)
+        try:
+            hikvision.create_user(user, window)
+        except HikvisionDuplicateUserError as error:
+            logger.error(
+                "%s: el equipo rechazo el alta del employeeNo %s por duplicado "
+                "aunque la busqueda no lo encontro: %s",
+                tag, user_id, error,
+            )
+            _report_staff_error(user_id, tag, error)
+            return
+        except (HikvisionError, ValueError) as error:
+            logger.error("%s: fallo el alta del employeeNo %s: %s", tag, user_id, error)
+            _report_staff_error(user_id, tag, error)
+            return
+
+        logger.info("%s: employeeNo %s creado con vigencia %s .. %s (hora local)",
+                    tag, user_id, inicio, fin)
+        estado = "creado"
+    else:
+        logger.info("%s: employeeNo %s encontrado en Hikvision", tag, user_id)
+
+        # El inicio que el equipo ya tiene se conserva: la fecha de ingreso de
+        # la persona no se recalcula cada vez que se resincroniza su rostro.
+        begin_time = hikvision.existing_begin_time(found)
+
+        try:
+            hikvision.update_user_end_date(user_id, window.end, begin_time=begin_time)
+        except (HikvisionError, ValueError) as error:
+            logger.error("%s: fallo la renovacion del employeeNo %s: %s", tag, user_id, error)
+            _report_staff_error(user_id, tag, error)
+            return
+
+        logger.info("%s: vigencia extendida hasta %s; inicio %s conservado",
+                    tag, fin, begin_time or "sin cambios")
+        estado = "actualizado"
+
+    # ------------------------------------------------------ 6. cargar el rostro
+    try:
+        hikvision.update_face(user_id, image_path)
+    except (HikvisionError, FaceImageError, OSError) as error:
+        # SINCRONIZACION PARCIAL: la ficha quedo escrita y el rostro no.
+        logger.error(
+            "%s: SINCRONIZACION PARCIAL del employeeNo %s: la ficha quedo %s "
+            "pero el rostro NO se cargo: %s",
+            tag, user_id, estado, error,
+        )
+        _report_staff_error(user_id, tag, error)
+        return
+
+    logger.info("%s: rostro cargado correctamente", tag)
+
+    # ----------------------------------- 7. marcar el estado en el backend
+    try:
+        fitonica.confirm_staff_face_id_synced(user_id)
+    except (FitonicaError, ValueError) as error:
+        logger.error(
+            "%s: el rostro quedo cargado en el equipo pero NO se pudo marcar "
+            "el estado del personal %s: %s",
+            tag, user_id, error,
+        )
+        return
+
+    logger.info("%s: estado del personal %s marcado como SUBIDO", tag, user_id)
+    logger.info("%s: sincronizacion completa del employeeNo %s (%s)", tag, user_id, estado)
+
+    # Solo tras completar las siete fases.
+    _COMPLETED_COMMANDS.append(command_id)
+
+
+def handle_delete_staff_member(command: Mapping[str, Any]) -> None:
+    """
+    Retira del equipo a quien dejo de pertenecer al personal.
+
+    NO CONSULTA A FITONICA, y es deliberado: cuando llega este comando el
+    vinculo YA se borro en la base de datos, asi que `get_staff_user`
+    responderia 404 y el borrado no llegaria a hacerse nunca. El `user_id` del
+    mensaje es todo lo que hace falta.
+
+    EL BACKEND YA DECIDIO QUE HAY QUE BORRAR. Si la persona conservara una
+    membresia vigente como clienta, no se habria publicado este comando sino un
+    `SYNC_USER_ACCESS`: en el equipo hay UNA sola ficha por persona y borrarla
+    le quitaria tambien el acceso que pago.
+
+    NO ACCIONA NINGUN RELE Y NO ABRE NADA.
+    """
+
+    # ---------------------------------------------------- 1. validar el comando
+    accepted = _accept_user_command(command, "DELETE_STAFF_MEMBER")
+    if accepted is None:
+        return
+
+    user_id, command_id, tag = accepted
+
+    # ------------------------------------- 2. buscar el employeeNo en el equipo
+    try:
+        found = hikvision.find_user(user_id)
+    except HikvisionError as error:
+        # Un fallo tecnico no se marca como completado: el comando podra
+        # reintentarse, y borrar a ciegas no es una opcion.
+        logger.error("%s: fallo la busqueda del employeeNo %s: %s", tag, user_id, error)
+        return
+
+    if found is None:
+        # NO-OP CON EXITO: no hay nada que borrar y el objetivo ya se cumple.
+        # Se marca como completado para que una reentrega no vuelva a buscar.
+        logger.info("%s: employeeNo %s no esta en el equipo; nada que borrar", tag, user_id)
+        _COMPLETED_COMMANDS.append(command_id)
+        return
+
+    # ------------------------------------------------------ 3. borrar la ficha
+    try:
+        borrado = hikvision.delete_user(user_id)
+    except HikvisionError as error:
+        logger.error("%s: fallo la baja del employeeNo %s: %s", tag, user_id, error)
+        return
+
+    logger.info(
+        "%s: employeeNo %s %s del equipo",
+        tag, user_id, "retirado" if borrado else "ya no estaba",
+    )
+
+    # ------------------------------- 4. y el rostro, si el equipo lo dejo
+    try:
+        if hikvision.face_exists(user_id):
+            hikvision.delete_face(user_id)
+            logger.info("%s: rostro del FPID %s eliminado de la libreria", tag, user_id)
+        else:
+            logger.info("%s: el equipo ya retiro el rostro del FPID %s", tag, user_id)
+    except HikvisionError as error:
+        # La ficha YA se borro: sin ella el equipo no deja pasar a nadie, asi
+        # que un rostro huerfano no concede acceso. Se registra y se da el
+        # comando por hecho en lugar de reintentar el borrado entero.
+        logger.warning(
+            "%s: la ficha del employeeNo %s se retiro, pero no se pudo comprobar "
+            "ni limpiar su rostro: %s",
+            tag, user_id, error,
+        )
+
+    logger.info("%s: baja completa del employeeNo %s", tag, user_id)
+    _COMPLETED_COMMANDS.append(command_id)
+
+
+def _report_staff_error(user_id: int, tag: str, error: object) -> None:
+    """
+    Avisa al backend de que el rostro del personal no pudo cargarse.
+
+    SE TRAGA SU PROPIO FALLO: ya estamos en el camino de error y lo ultimo que
+    conviene es sustituir el mensaje original por otro.
+    """
+
+    try:
+        fitonica.report_staff_face_id_error(user_id, error)
+    except (FitonicaError, ValueError) as report_error:
+        logger.warning("%s: tampoco se pudo reportar el fallo al backend: %s", tag, report_error)
 
 
 def _accept_user_command(

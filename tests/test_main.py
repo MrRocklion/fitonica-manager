@@ -58,7 +58,11 @@ os.environ.update(
 
 import main  # noqa: E402 - el entorno tiene que estar listo antes
 from fitonica import FitonicaError, Membership  # noqa: E402
-from hikvision import HikvisionCommunicationError, HikvisionError  # noqa: E402
+from hikvision import (  # noqa: E402
+    AccessWindow,
+    HikvisionCommunicationError,
+    HikvisionError,
+)
 from tests.stubs import StubOutputDevice  # noqa: E402
 
 USER = {
@@ -102,11 +106,17 @@ class FakeFitonica:
         fail_user=None,
         fail_image=None,
         fail_confirm=None,
+        fail_staff_user=None,
+        fail_staff_image=None,
+        fail_staff_confirm=None,
     ) -> None:
         self.user = user if user is not None else dict(USER)
         self.fail_user = fail_user
         self.fail_image = fail_image
         self.fail_confirm = fail_confirm
+        self.fail_staff_user = fail_staff_user
+        self.fail_staff_image = fail_staff_image
+        self.fail_staff_confirm = fail_staff_confirm
         self.calls: list[tuple] = []
 
     def get_user(self, user_id: int) -> dict:
@@ -120,6 +130,32 @@ class FakeFitonica:
         if self.fail_image:
             raise self.fail_image
         return IMAGE
+
+    # ---------------------------------------------------------- Personal
+
+    def get_staff_user(self, user_id: int) -> dict:
+        self.calls.append(("get_staff_user", user_id))
+        if self.fail_staff_user:
+            raise self.fail_staff_user
+        return self.user
+
+    def download_staff_face_id(self, user_id: int, user: dict | None = None) -> Path:
+        self.calls.append(("download_staff_face_id", user_id, user is not None))
+        if self.fail_staff_image:
+            raise self.fail_staff_image
+        return IMAGE
+
+    def confirm_staff_face_id_synced(self, user_id: int) -> dict:
+        self.calls.append(("confirm_staff_face_id_synced", user_id))
+        if self.fail_staff_confirm:
+            raise self.fail_staff_confirm
+        return {"user_id": user_id, "face_status": "SUBIDO"}
+
+    def report_staff_face_id_error(self, user_id: int, error: object = None) -> dict:
+        self.calls.append(("report_staff_face_id_error", user_id))
+        return {"user_id": user_id, "face_status": "ERROR"}
+
+    # ---------------------------------------------------------- Clientes
 
     def confirm_face_id_synced(self, user_id: int) -> dict:
         self.calls.append(("confirm_face_id_synced", user_id))
@@ -149,8 +185,8 @@ class FakeHikvision:
         self._maybe_fail("find_user")
         return self.found
 
-    def create_user(self, user: dict, membership: Membership) -> str:
-        self.calls.append(("create_user", user["id"], membership.start, membership.end))
+    def create_user(self, user: dict, window: AccessWindow) -> str:
+        self.calls.append(("create_user", user["id"], window))
         self._maybe_fail("create_user")
         return str(user["id"])
 
@@ -161,6 +197,23 @@ class FakeHikvision:
     def update_face(self, user_id: int, image_path: Path) -> None:
         self.calls.append(("update_face", user_id, image_path))
         self._maybe_fail("update_face")
+
+    # ------------------------------------------------------------- Baja
+
+    def delete_user(self, user_id: int) -> bool:
+        self.calls.append(("delete_user", user_id))
+        self._maybe_fail("delete_user")
+        return True
+
+    def face_exists(self, user_id: int) -> bool:
+        self.calls.append(("face_exists", user_id))
+        self._maybe_fail("face_exists")
+        return bool(self.fails.get("_face_remains", False))
+
+    def delete_face(self, user_id: int) -> bool:
+        self.calls.append(("delete_face", user_id))
+        self._maybe_fail("delete_face")
+        return True
 
     @staticmethod
     def existing_begin_time(found: dict) -> str | None:
@@ -282,10 +335,10 @@ class NewUserFlowTests(MainTestCase):
         with self.assertLogs("main", level="INFO"):
             main.on_message(None, None, message(command()))
 
-        _, user_id, start, end = equipo.calls[1]
+        _, user_id, window = equipo.calls[1]
         self.assertEqual(user_id, 1394)
-        self.assertEqual(start.isoformat(), "2026-11-01T05:00:00+00:00")
-        self.assertEqual(end.isoformat(), "2026-12-01T04:59:59.999000+00:00")
+        self.assertEqual(window.start.isoformat(), "2026-11-01T05:00:00+00:00")
+        self.assertEqual(window.end.isoformat(), "2026-12-01T04:59:59.999000+00:00")
 
     def test_el_rostro_usa_la_ruta_que_devolvio_la_descarga(self) -> None:
         api, equipo = FakeFitonica(), FakeHikvision(found=None)
@@ -1025,6 +1078,465 @@ class SyncUserAccessTests(MainTestCase):
 
         with self.assertLogs("main", level="INFO"):
             main.on_message(None, None, message(sync_command()))
+            main.on_message(None, None, message({"type": "NORMAL_PASS", "command_id": "p-1"}))
+
+        self.assertEqual(StubOutputDevice.events, ["on:21", "off:21"])
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# UPDATE_STAFF_FACE_ID y DELETE_STAFF_MEMBER
+# ════════════════════════════════════════════════════════════════════════════
+
+def staff_command(**overrides: object) -> dict:
+    now = datetime.now(timezone.utc)
+    return {
+        "version": 1,
+        "command_id": "st-123",
+        "type": "UPDATE_STAFF_FACE_ID",
+        "user_id": 1394,
+        "requested_at": now.isoformat(),
+        "expires_at": (now + timedelta(seconds=10)).isoformat(),
+        **overrides,
+    }
+
+
+def delete_command(**overrides: object) -> dict:
+    now = datetime.now(timezone.utc)
+    return {
+        "version": 1,
+        "command_id": "dl-123",
+        "type": "DELETE_STAFF_MEMBER",
+        "user_id": 1394,
+        "requested_at": now.isoformat(),
+        "expires_at": (now + timedelta(seconds=10)).isoformat(),
+        **overrides,
+    }
+
+
+class UpdateStaffFaceIdTests(MainTestCase):
+    """
+    LO QUE PROTEGEN ESTAS PRUEBAS
+    -----------------------------
+     1. QUE NO ABRA LA PUERTA. Es una orden administrativa.
+     2. QUE USE LAS RUTAS DE PERSONAL. `get_user` exige membresía vigente y a un
+        recepcionista le respondería 404.
+     3. LA VENTANA DE VIGENCIA: hoy 00:00 .. 2035-12-31 23:59:59, que es lo que
+        sustituye a las fechas de una membresía que el personal no tiene.
+    """
+
+    def test_se_despacha_a_su_propio_manejador(self) -> None:
+        api, equipo = FakeFitonica(), FakeHikvision(found=None)
+        self.wire(api, equipo)
+
+        with self.assertLogs("main", level="INFO"):
+            main.on_message(None, None, message(staff_command()))
+
+        self.assertEqual(self.names(equipo), ["find_user", "create_user", "update_face"])
+
+    def test_no_esta_en_la_tabla_de_reles(self) -> None:
+        self.assertNotIn("UPDATE_STAFF_FACE_ID", main.PASS_HANDLERS)
+        self.assertNotIn("DELETE_STAFF_MEMBER", main.PASS_HANDLERS)
+
+    def test_no_acciona_ningun_rele(self) -> None:
+        api, equipo = FakeFitonica(), FakeHikvision(found=None)
+        self.wire(api, equipo)
+
+        with self.assertLogs("main", level="INFO"):
+            main.on_message(None, None, message(staff_command()))
+
+        self.assertEqual(StubOutputDevice.events, [])
+
+    # ------------------------------------------------------- Validación
+
+    def test_rechaza_un_user_id_invalido(self) -> None:
+        for invalido in (None, 0, -5, "1394", True):
+            with self.subTest(user_id=invalido):
+                api, equipo = FakeFitonica(), FakeHikvision(found=None)
+                self.wire(api, equipo)
+
+                with self.assertLogs("main", level="WARNING"):
+                    main.on_message(None, None, message(staff_command(user_id=invalido)))
+
+                self.assertEqual(api.calls, [])
+                self.assertEqual(equipo.calls, [])
+
+    def test_rechaza_un_comando_sin_command_id(self) -> None:
+        api, equipo = FakeFitonica(), FakeHikvision(found=None)
+        self.wire(api, equipo)
+        orden = staff_command()
+        del orden["command_id"]
+
+        with self.assertLogs("main", level="WARNING"):
+            main.on_message(None, None, message(orden))
+
+        self.assertEqual(api.calls, [])
+
+    def test_una_orden_caducada_no_consulta_nada(self) -> None:
+        api, equipo = FakeFitonica(), FakeHikvision(found=None)
+        self.wire(api, equipo)
+        vieja = datetime.now(timezone.utc) - timedelta(minutes=5)
+
+        with self.assertLogs("main", level="WARNING"):
+            main.on_message(None, None, message(staff_command(expires_at=vieja.isoformat())))
+
+        self.assertEqual(api.calls, [])
+        self.assertEqual(equipo.calls, [])
+
+    def test_un_duplicado_se_ignora(self) -> None:
+        api, equipo = FakeFitonica(), FakeHikvision(found=None)
+        self.wire(api, equipo)
+
+        with self.assertLogs("main", level="INFO"):
+            main.on_message(None, None, message(staff_command()))
+            main.on_message(None, None, message(staff_command()))
+
+        self.assertEqual(self.names(equipo).count("create_user"), 1)
+
+    # ------------------------------------------- Rutas de personal
+
+    def test_usa_las_rutas_de_personal_y_no_las_de_cliente(self) -> None:
+        api, equipo = FakeFitonica(), FakeHikvision(found=None)
+        self.wire(api, equipo)
+
+        with self.assertLogs("main", level="INFO"):
+            main.on_message(None, None, message(staff_command()))
+
+        self.assertEqual(
+            self.names(api),
+            ["get_staff_user", "download_staff_face_id", "confirm_staff_face_id_synced"],
+        )
+        for de_cliente in ("get_user", "download_face_id", "confirm_face_id_synced"):
+            self.assertNotIn(de_cliente, self.names(api))
+
+    def test_no_consulta_dos_veces_al_usuario(self) -> None:
+        api, equipo = FakeFitonica(), FakeHikvision(found=None)
+        self.wire(api, equipo)
+
+        with self.assertLogs("main", level="INFO"):
+            main.on_message(None, None, message(staff_command()))
+
+        self.assertEqual(self.names(api).count("get_staff_user"), 1)
+        # La descarga reutiliza el usuario ya obtenido.
+        self.assertTrue(api.calls[1][2])
+
+    # ------------------------------------------- Vigencia del personal
+
+    def test_un_alta_nueva_usa_la_ventana_del_personal(self) -> None:
+        """Hoy a las 00:00 y fin exacto en 2035-12-31 23:59:59."""
+
+        api, equipo = FakeFitonica(), FakeHikvision(found=None)
+        self.wire(api, equipo)
+
+        with self.assertLogs("main", level="INFO"):
+            main.on_message(None, None, message(staff_command()))
+
+        _, user_id, window = equipo.calls[1]
+        hoy = datetime.now(main.hikvision.timezone).date()
+        self.assertEqual(user_id, 1394)
+        self.assertEqual(window.start.date(), hoy)
+        self.assertEqual((window.start.hour, window.start.minute, window.start.second), (0, 0, 0))
+        self.assertEqual(
+            window.end.strftime("%Y-%m-%d %H:%M:%S"), "2035-12-31 23:59:59"
+        )
+
+    def test_la_ventana_va_en_la_zona_configurada(self) -> None:
+        api, equipo = FakeFitonica(), FakeHikvision(found=None)
+        self.wire(api, equipo)
+
+        with self.assertLogs("main", level="INFO"):
+            main.on_message(None, None, message(staff_command()))
+
+        window = equipo.calls[1][2]
+        self.assertEqual(str(window.start.tzinfo), "America/Guayaquil")
+        self.assertEqual(str(window.end.tzinfo), "America/Guayaquil")
+
+    def test_no_se_inventa_ninguna_membresia(self) -> None:
+        """El personal no tiene membresía: se pasa una ventana, no una falsa."""
+
+        api, equipo = FakeFitonica(), FakeHikvision(found=None)
+        self.wire(api, equipo)
+
+        with self.assertLogs("main", level="INFO"):
+            main.on_message(None, None, message(staff_command()))
+
+        window = equipo.calls[1][2]
+        self.assertIsInstance(window, AccessWindow)
+        self.assertFalse(hasattr(window, "id"))
+
+    def test_un_usuario_existente_conserva_su_inicio(self) -> None:
+        api = FakeFitonica()
+        equipo = FakeHikvision(found={"employeeNo": "1394", "Valid": {"beginTime": "2025-03-15T08:30:00"}})
+        self.wire(api, equipo)
+
+        with self.assertLogs("main", level="INFO"):
+            main.on_message(None, None, message(staff_command()))
+
+        self.assertEqual(self.names(equipo), ["find_user", "update_user_end_date", "update_face"])
+        _, user_id, end_date, begin_time = equipo.calls[1]
+        self.assertEqual(begin_time, "2025-03-15T08:30:00")
+        self.assertEqual(end_date.strftime("%Y-%m-%d %H:%M:%S"), "2035-12-31 23:59:59")
+
+    def test_un_usuario_existente_no_se_vuelve_a_crear(self) -> None:
+        api = FakeFitonica()
+        equipo = FakeHikvision(found={"employeeNo": "1394"})
+        self.wire(api, equipo)
+
+        with self.assertLogs("main", level="INFO"):
+            main.on_message(None, None, message(staff_command()))
+
+        self.assertNotIn("create_user", self.names(equipo))
+
+    # --------------------------------------------------- Cascada y errores
+
+    def test_si_falla_fitonica_no_se_toca_el_equipo(self) -> None:
+        api = FakeFitonica(fail_staff_user=FitonicaError("404 no es personal"))
+        equipo = FakeHikvision(found=None)
+        self.wire(api, equipo)
+
+        with self.assertLogs("main", level="ERROR"):
+            main.on_message(None, None, message(staff_command()))
+
+        self.assertEqual(equipo.calls, [])
+
+    def test_si_falla_la_descarga_no_se_toca_el_equipo(self) -> None:
+        api = FakeFitonica(fail_staff_image=FitonicaError("sin imagen"))
+        equipo = FakeHikvision(found=None)
+        self.wire(api, equipo)
+
+        with self.assertLogs("main", level="ERROR"):
+            main.on_message(None, None, message(staff_command()))
+
+        self.assertEqual(equipo.calls, [])
+
+    def test_si_la_busqueda_falla_no_se_intenta_crear(self) -> None:
+        api = FakeFitonica()
+        equipo = FakeHikvision(find_user=HikvisionCommunicationError("sin respuesta"))
+        self.wire(api, equipo)
+
+        with self.assertLogs("main", level="ERROR"):
+            main.on_message(None, None, message(staff_command()))
+
+        self.assertEqual(self.names(equipo), ["find_user"])
+
+    def test_si_falla_el_rostro_se_reporta_el_error_al_backend(self) -> None:
+        api = FakeFitonica()
+        equipo = FakeHikvision(found=None, update_face=HikvisionError("imagen rechazada"))
+        self.wire(api, equipo)
+
+        with self.assertLogs("main", level="ERROR") as registro:
+            main.on_message(None, None, message(staff_command()))
+
+        self.assertIn("SINCRONIZACION PARCIAL", "\n".join(registro.output))
+        self.assertIn("report_staff_face_id_error", self.names(api))
+        self.assertNotIn("confirm_staff_face_id_synced", self.names(api))
+
+    def test_solo_marca_completado_tras_las_siete_fases(self) -> None:
+        api, equipo = FakeFitonica(), FakeHikvision(found=None)
+        self.wire(api, equipo)
+
+        with self.assertLogs("main", level="INFO"):
+            main.on_message(None, None, message(staff_command()))
+
+        self.assertIn("st-123", main._COMPLETED_COMMANDS)
+
+    def test_un_fallo_al_confirmar_no_marca_el_comando(self) -> None:
+        api = FakeFitonica(fail_staff_confirm=FitonicaError("HTTP 503"))
+        equipo = FakeHikvision(found=None)
+        self.wire(api, equipo)
+
+        with self.assertLogs("main", level="ERROR"):
+            main.on_message(None, None, message(staff_command()))
+
+        self.assertNotIn("st-123", main._COMPLETED_COMMANDS)
+
+    def test_una_excepcion_no_derriba_el_servicio(self) -> None:
+        api = FakeFitonica()
+        equipo = FakeHikvision(find_user=RuntimeError("algo inesperado"))
+        self.wire(api, equipo)
+
+        with self.assertLogs("main", level="ERROR") as registro:
+            main.on_message(None, None, message(staff_command()))
+
+        self.assertIn("error no controlado", "\n".join(registro.output))
+
+
+class DeleteStaffMemberTests(MainTestCase):
+    """
+    LO QUE PROTEGEN ESTAS PRUEBAS
+    -----------------------------
+     1. QUE NO CONSULTE AL BACKEND. El vínculo ya se borró: `get_staff_user`
+        respondería 404 y la baja no llegaría a hacerse nunca.
+     2. QUE SEA IDEMPOTENTE. «No estaba» es un éxito, no un fallo.
+     3. QUE UN FALLO TÉCNICO NO SE DÉ POR HECHO, para poder reintentarlo.
+    """
+
+    def test_se_despacha_a_su_propio_manejador(self) -> None:
+        api, equipo = FakeFitonica(), FakeHikvision(found={"employeeNo": "1394"})
+        self.wire(api, equipo)
+
+        with self.assertLogs("main", level="INFO"):
+            main.on_message(None, None, message(delete_command()))
+
+        self.assertIn("delete_user", self.names(equipo))
+
+    def test_NO_consulta_al_backend(self) -> None:
+        """El vínculo ya no existe: preguntar por él daría 404."""
+
+        api, equipo = FakeFitonica(), FakeHikvision(found={"employeeNo": "1394"})
+        self.wire(api, equipo)
+
+        with self.assertLogs("main", level="INFO"):
+            main.on_message(None, None, message(delete_command()))
+
+        self.assertEqual(api.calls, [])
+
+    def test_no_acciona_ningun_rele(self) -> None:
+        api, equipo = FakeFitonica(), FakeHikvision(found={"employeeNo": "1394"})
+        self.wire(api, equipo)
+
+        with self.assertLogs("main", level="INFO"):
+            main.on_message(None, None, message(delete_command()))
+
+        self.assertEqual(StubOutputDevice.events, [])
+
+    def test_busca_por_el_id_del_usuario(self) -> None:
+        api, equipo = FakeFitonica(), FakeHikvision(found={"employeeNo": "1394"})
+        self.wire(api, equipo)
+
+        with self.assertLogs("main", level="INFO"):
+            main.on_message(None, None, message(delete_command()))
+
+        self.assertEqual(equipo.calls[0], ("find_user", 1394))
+
+    # ---------------------------------------------------- Idempotencia
+
+    def test_un_usuario_inexistente_es_un_no_op_exitoso(self) -> None:
+        api, equipo = FakeFitonica(), FakeHikvision(found=None)
+        self.wire(api, equipo)
+
+        with self.assertLogs("main", level="INFO") as registro:
+            main.on_message(None, None, message(delete_command()))
+
+        self.assertEqual(self.names(equipo), ["find_user"])
+        self.assertIn("nada que borrar", "\n".join(registro.output))
+        # Se da por hecho: el objetivo ya se cumple.
+        self.assertIn("dl-123", main._COMPLETED_COMMANDS)
+
+    def test_una_reentrega_no_vuelve_a_borrar(self) -> None:
+        api, equipo = FakeFitonica(), FakeHikvision(found={"employeeNo": "1394"})
+        self.wire(api, equipo)
+
+        with self.assertLogs("main", level="INFO"):
+            main.on_message(None, None, message(delete_command()))
+            main.on_message(None, None, message(delete_command()))
+
+        self.assertEqual(self.names(equipo).count("delete_user"), 1)
+
+    def test_una_orden_caducada_no_borra_nada(self) -> None:
+        api, equipo = FakeFitonica(), FakeHikvision(found={"employeeNo": "1394"})
+        self.wire(api, equipo)
+        vieja = datetime.now(timezone.utc) - timedelta(minutes=5)
+
+        with self.assertLogs("main", level="WARNING"):
+            main.on_message(None, None, message(delete_command(expires_at=vieja.isoformat())))
+
+        self.assertEqual(equipo.calls, [])
+
+    def test_rechaza_un_user_id_invalido(self) -> None:
+        api, equipo = FakeFitonica(), FakeHikvision(found={"employeeNo": "1394"})
+        self.wire(api, equipo)
+
+        with self.assertLogs("main", level="WARNING"):
+            main.on_message(None, None, message(delete_command(user_id=0)))
+
+        self.assertEqual(equipo.calls, [])
+
+    # ------------------------------------------------------- El rostro
+
+    def test_si_el_equipo_dejo_el_rostro_se_borra_tambien(self) -> None:
+        api = FakeFitonica()
+        equipo = FakeHikvision(found={"employeeNo": "1394"}, _face_remains=True)
+        self.wire(api, equipo)
+
+        with self.assertLogs("main", level="INFO"):
+            main.on_message(None, None, message(delete_command()))
+
+        self.assertEqual(
+            self.names(equipo), ["find_user", "delete_user", "face_exists", "delete_face"]
+        )
+
+    def test_si_el_equipo_ya_lo_retiro_no_se_borra_dos_veces(self) -> None:
+        api = FakeFitonica()
+        equipo = FakeHikvision(found={"employeeNo": "1394"})
+        self.wire(api, equipo)
+
+        with self.assertLogs("main", level="INFO"):
+            main.on_message(None, None, message(delete_command()))
+
+        self.assertNotIn("delete_face", self.names(equipo))
+
+    def test_un_fallo_al_limpiar_el_rostro_no_invalida_la_baja(self) -> None:
+        """Sin ficha no se entra, así que un rostro huérfano no concede acceso."""
+
+        api = FakeFitonica()
+        equipo = FakeHikvision(
+            found={"employeeNo": "1394"}, face_exists=HikvisionError("timeout")
+        )
+        self.wire(api, equipo)
+
+        with self.assertLogs("main", level="WARNING") as registro:
+            main.on_message(None, None, message(delete_command()))
+
+        self.assertIn("no se pudo comprobar", "\n".join(registro.output))
+        self.assertIn("dl-123", main._COMPLETED_COMMANDS)
+
+    # ------------------------------------------------- Fallos técnicos
+
+    def test_un_fallo_de_busqueda_no_marca_el_comando(self) -> None:
+        api = FakeFitonica()
+        equipo = FakeHikvision(find_user=HikvisionCommunicationError("timeout"))
+        self.wire(api, equipo)
+
+        with self.assertLogs("main", level="ERROR"):
+            main.on_message(None, None, message(delete_command()))
+
+        self.assertNotIn("dl-123", main._COMPLETED_COMMANDS)
+        self.assertNotIn("delete_user", self.names(equipo))
+
+    def test_un_fallo_al_borrar_no_marca_el_comando(self) -> None:
+        api = FakeFitonica()
+        equipo = FakeHikvision(
+            found={"employeeNo": "1394"}, delete_user=HikvisionError("rechazado")
+        )
+        self.wire(api, equipo)
+
+        with self.assertLogs("main", level="ERROR"):
+            main.on_message(None, None, message(delete_command()))
+
+        self.assertNotIn("dl-123", main._COMPLETED_COMMANDS)
+
+    def test_una_excepcion_no_derriba_el_servicio_y_el_siguiente_se_procesa(self) -> None:
+        api = FakeFitonica()
+        equipo = FakeHikvision(find_user=RuntimeError("algo inesperado"))
+        self.wire(api, equipo)
+
+        with self.assertLogs("main", level="ERROR"):
+            main.on_message(None, None, message(delete_command()))
+
+        sano = FakeHikvision(found={"employeeNo": "1394"})
+        self.wire(FakeFitonica(), sano)
+
+        with self.assertLogs("main", level="INFO"):
+            main.on_message(None, None, message(delete_command(command_id="dl-456")))
+
+        self.assertIn("delete_user", self.names(sano))
+
+    def test_un_pase_sigue_funcionando_despues(self) -> None:
+        api, equipo = FakeFitonica(), FakeHikvision(found={"employeeNo": "1394"})
+        self.wire(api, equipo)
+
+        with self.assertLogs("main", level="INFO"):
+            main.on_message(None, None, message(delete_command()))
             main.on_message(None, None, message({"type": "NORMAL_PASS", "command_id": "p-1"}))
 
         self.assertEqual(StubOutputDevice.events, ["on:21", "off:21"])

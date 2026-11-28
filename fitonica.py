@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import mimetypes
 import os
 import re
@@ -13,6 +14,9 @@ from pathlib import Path
 from typing import Any, Mapping
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
+
+
+logger = logging.getLogger(__name__)
 
 
 class FitonicaError(RuntimeError):
@@ -188,8 +192,102 @@ class Fitonica:
                 f"{user.get('id')!r} != {user_id!r}"
             )
 
+        return self._download_face_id(
+            user, f"/api/devices/access/users/{user_id}/face-id/url"
+        )
+
+    # ──────────────────────────────────────────────────────────── Personal
+    #
+    # El PERSONAL no tiene membresía: un recepcionista puede no haber comprado
+    # nunca un plan, así que `get_user` —que exige una membresía vigente— le
+    # responderia 404. De ahi que estas rutas existan aparte, contra
+    # `staff_membership`, en lugar de reutilizar las de cliente.
+
+    def get_staff_user(self, user_id: int) -> dict[str, Any]:
+        """
+        Miembro del personal activo del establecimiento del equipo.
+
+        NO DEVUELVE VIGENCIA, al contrario que `get_user`. El personal no tiene
+        fechas que consultar: su ventana de acceso la decide el dispositivo al
+        escribirla en el equipo. Por eso tampoco se llama a `parse_membership`
+        sobre esta respuesta.
+        """
+
+        self._validate_user_id(user_id)
+        return self._api_get(f"/api/devices/access/staff/{user_id}")
+
+    def download_staff_face_id(
+        self, user_id: int, user: Mapping[str, Any] | None = None
+    ) -> Path:
+        """
+        Descarga el rostro de un miembro del personal, en `users/`.
+
+        Mismo nombre de archivo que para un cliente —`<uuid>_<cedula>.<ext>`— y
+        mismo directorio: para el equipo son la misma clase de dato y mezclarlos
+        en dos carpetas sólo complicaria el soporte.
+
+        `user` EVITA LA SEGUNDA CONSULTA, igual que en la version de cliente.
+        """
+
+        self._validate_user_id(user_id)
+
+        if user is None:
+            user = self.get_staff_user(user_id)
+        elif user.get("id") != user_id:
+            raise ValueError(
+                "El usuario recibido no corresponde al user_id solicitado: "
+                f"{user.get('id')!r} != {user_id!r}"
+            )
+
+        return self._download_face_id(
+            user, f"/api/devices/access/staff/{user_id}/face-id/url"
+        )
+
+    def confirm_staff_face_id_synced(self, user_id: int) -> dict[str, Any]:
+        """
+        Avisa de que el rostro del personal quedo cargado en el equipo.
+
+        SIN CUERPO, como su gemela de clientes: el dispositivo informa de un
+        hecho, no elige el estado. El unico que esta ruta escribe es `SUBIDO`.
+        """
+
+        self._validate_user_id(user_id)
+        return self._api_request(
+            f"/api/devices/access/staff/{user_id}/face-id/synced", method="POST"
+        )
+
+    def report_staff_face_id_error(self, user_id: int, error: object = None) -> dict[str, Any]:
+        """
+        Avisa de que el rostro del personal NO pudo cargarse.
+
+        `error` ES SOLO PARA EL LOG LOCAL: no viaja a la API a proposito. Un
+        texto libre enviado por un lector acabaria pintandose en el panel del
+        gimnasio, y el motivo tecnico ya queda en el archivo de registro de esta
+        Raspberry, que es donde lo busca soporte.
+        """
+
+        self._validate_user_id(user_id)
+        if error is not None:
+            logger.warning("Face ID del personal %s rechazado: %s", user_id, error)
+
+        return self._api_request(
+            f"/api/devices/access/staff/{user_id}/face-id/error", method="POST"
+        )
+
+    # ────────────────────────────────────────────────────────── Compartido
+
+    def _download_face_id(self, user: Mapping[str, Any], signed_url_path: str) -> Path:
+        """
+        Descarga el rostro desde una URL firmada y lo guarda en `users/`.
+
+        LO COMPARTEN CLIENTES Y PERSONAL: lo unico que cambia entre los dos es
+        la ruta que emite el enlace. El limite de tamano, la comprobacion de que
+        es una imagen y el nombre del archivo son los mismos, y duplicarlos
+        habria dejado dos sitios donde corregir el mismo fallo.
+        """
+
         dni = self._safe_dni(user.get("dni"))
-        signed = self._api_get(f"/api/devices/access/users/{user_id}/face-id/url")
+        signed = self._api_get(signed_url_path)
         url = signed.get("url")
         if not isinstance(url, str) or not url.startswith(("http://", "https://")):
             raise FitonicaError("La API no devolvio una URL valida para el Face ID")

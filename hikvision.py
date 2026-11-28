@@ -41,9 +41,29 @@ import requests
 from requests.auth import HTTPDigestAuth
 
 from face_image import ensure_device_jpeg
-from fitonica import Membership
+from dataclasses import dataclass
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class AccessWindow:
+    """
+    Ventana de vigencia que se escribe en `Valid` del equipo.
+
+    POR QUE NO SE PASA LA MEMBRESIA DIRECTAMENTE: el PERSONAL no tiene. Un
+    recepcionista no compro ningun plan, y su acceso no «vence» por una venta
+    sino por dejar de trabajar aqui. Con este tipo, el cliente aporta las fechas
+    de su membresia y el personal una ventana larga y fija, sin que
+    `create_user` tenga que saber de cual de los dos se trata ni haya que
+    inventar una membresia ficticia para el staff.
+
+    Las dos fechas llevan zona: `to_device_time` las convierte a la hora local
+    del establecimiento antes de formatearlas.
+    """
+
+    start: datetime
+    end: datetime
 
 # --------------------------------------------------------------------- Contrato
 
@@ -82,6 +102,10 @@ DEFAULT_TIMEOUT_SECONDS = 20.0
 
 #: `subStatusCode` con el que el equipo avisa de que el `employeeNo` ya existe.
 DUPLICATE_SUB_STATUS = "employeeNoAlreadyExist"
+
+#: Fragmentos de `subStatusCode` con los que el equipo dice «no habia a quien
+#: borrar». Se tratan como exito: el borrado tiene que ser idempotente.
+NOT_FOUND_SUB_STATUS = ("notexist", "nosuch", "invalidemployeeno")
 
 
 # ----------------------------------------------------------------- Excepciones
@@ -130,6 +154,15 @@ class HikvisionDuplicateUserError(HikvisionResponseError):
 
 
 # ------------------------------------------------------------------- Utilidades
+
+
+def toint(value: object) -> int:
+    """Entero tolerante: el firmware devuelve los recuentos como texto."""
+
+    try:
+        return int(str(value))
+    except (TypeError, ValueError):
+        return 0
 
 
 def map_gender(value: object) -> str:
@@ -355,7 +388,7 @@ class Hikvision:
 
     # -------------------------------------------------------------------- Alta
 
-    def create_user(self, user: Mapping[str, Any], membership: Membership) -> str:
+    def create_user(self, user: Mapping[str, Any], window: AccessWindow) -> str:
         """
         Da de alta a la persona con la vigencia completa de su membresia.
 
@@ -377,12 +410,12 @@ class Hikvision:
             "POST",
             "/ISAPI/AccessControl/UserInfo/Record?format=json",
             action=f"alta del empleado {employee_no}",
-            data=json.dumps({"UserInfo": self._user_info(user, membership)}),
+            data=json.dumps({"UserInfo": self._user_info(user, window)}),
         )
 
         return employee_no
 
-    def _user_info(self, user: Mapping[str, Any], membership: Membership) -> dict[str, Any]:
+    def _user_info(self, user: Mapping[str, Any], window: AccessWindow) -> dict[str, Any]:
         """Payload de `UserInfo/Record`."""
 
         return {
@@ -392,8 +425,8 @@ class Hikvision:
             "userType": "normal",
             "Valid": {
                 "enable": True,
-                "beginTime": self.to_device_time(membership.start),
-                "endTime": self.to_device_time(membership.end),
+                "beginTime": self.to_device_time(window.start),
+                "endTime": self.to_device_time(window.end),
                 "timeType": VALID_TIME_TYPE,
             },
             # `doorRight` y `RightPlan` declaran una sola puerta en este modelo
@@ -507,6 +540,118 @@ class Hikvision:
                 # El contenedor ya esta garantizado por `ensure_device_jpeg`.
                 files={"img": (upload_path.name, image, "image/jpeg")},
             )
+
+    # ------------------------------------------------------------------ Baja
+
+    def delete_user(self, user_id: int | str) -> bool:
+        """
+        Retira del equipo la ficha de una persona. Devuelve si existia.
+
+        ES IDEMPOTENTE: que no hubiera nada que borrar NO es un error. El
+        comando puede reentregarse, y la segunda vez el empleado ya no esta.
+
+        EL VERBO ES `PUT`, no `POST`. Es el de la especificacion ISAPI para
+        `/UserInfo/Delete` y el que ya usa esta clase para `/UserInfo/Modify`;
+        `Record` y `Search` son `POST` porque alli si lo son. Algunos firmwares
+        aceptan tambien `POST`, de modo que un `405` se reintenta una vez con
+        ese verbo antes de darlo por fallido: es la unica incertidumbre que no
+        pudo comprobarse contra el equipo (ver el README).
+
+        `EmployeeNoList` ADMITE HASTA 30 por llamada segun las capabilities,
+        pero aqui se borra de uno en uno: el comando MQTT trae una sola persona
+        y agrupar obligaria a mantener una cola.
+        """
+
+        employee_no = str(user_id)
+        body = json.dumps(
+            {"UserInfoDelCond": {"EmployeeNoList": [{"employeeNo": employee_no}]}}
+        )
+        action = f"baja del empleado {employee_no}"
+        path = "/ISAPI/AccessControl/UserInfo/Delete?format=json"
+
+        try:
+            self._request("PUT", path, action=action, data=body)
+        except HikvisionResponseError as error:
+            # 405: el firmware no admite `PUT` en esta ruta. Se intenta `POST`,
+            # que es la otra variante que circula para el mismo endpoint.
+            if error.http_status == 405:
+                logger.warning("%s: el equipo rechazo PUT; se reintenta con POST", action)
+                self._request("POST", path, action=action, data=body)
+                return True
+
+            if error.sub_status and any(
+                fragment in error.sub_status.lower() for fragment in NOT_FOUND_SUB_STATUS
+            ):
+                logger.info("%s: no habia ficha que borrar", action)
+                return False
+
+            raise
+
+        return True
+
+    def face_exists(self, user_id: int | str) -> bool:
+        """
+        Indica si la libreria facial conserva un rostro para ese `FPID`.
+
+        POR QUE SE COMPRUEBA EN LUGAR DE BORRAR A CIEGAS: en esta familia,
+        `isSupportControlPersonRecordByHumanId` es `true`, lo que sugiere que
+        borrar la ficha arrastra su rostro. «Sugiere» no es «garantiza», y un
+        rostro huerfano en la biblioteca seguiria reconociendo a alguien que ya
+        no trabaja aqui. Preguntar primero cuesta una peticion y evita tanto el
+        huerfano como un borrado que el equipo rechazaria por no existir.
+        """
+
+        fpid = str(user_id)
+
+        payload = self._request(
+            "POST",
+            "/ISAPI/Intelligent/FDLib/FDSearch?format=json",
+            action=f"consulta del rostro {fpid}",
+            data=json.dumps(
+                {
+                    "searchResultPosition": 0,
+                    "maxResults": 1,
+                    "faceLibType": FACE_LIB_TYPE,
+                    "FDID": FACE_LIB_ID,
+                    "FPID": fpid,
+                }
+            ),
+        )
+
+        matches = payload.get("MatchList")
+        if isinstance(matches, list) and matches:
+            return True
+
+        # Sin `MatchList`, el recuento es la otra senal que devuelve el equipo.
+        return bool(toint(payload.get("numOfMatches")))
+
+    def delete_face(self, user_id: int | str) -> bool:
+        """
+        Borra el rostro de la libreria facial. Devuelve si habia algo que borrar.
+
+        TAMBIEN IDEMPOTENTE, por el mismo motivo que {@link delete_user}.
+        """
+
+        fpid = str(user_id)
+        action = f"baja del rostro {fpid}"
+
+        try:
+            self._request(
+                "PUT",
+                "/ISAPI/Intelligent/FDLib/FDSearch/Delete"
+                f"?format=json&FDID={FACE_LIB_ID}&faceLibType={FACE_LIB_TYPE}",
+                action=action,
+                data=json.dumps({"FPID": [{"value": fpid}]}),
+            )
+        except HikvisionResponseError as error:
+            if error.sub_status and any(
+                fragment in error.sub_status.lower() for fragment in NOT_FOUND_SUB_STATUS
+            ):
+                logger.info("%s: no habia rostro que borrar", action)
+                return False
+            raise
+
+        return True
 
     # ------------------------------------------------------------- Transporte
 

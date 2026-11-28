@@ -37,6 +37,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from fitonica import Membership
 from hikvision import (
+    AccessWindow,
     Hikvision,
     HikvisionCommunicationError,
     HikvisionDuplicateUserError,
@@ -57,6 +58,10 @@ MEMBERSHIP = Membership(
     start=datetime(2026, 11, 1, 5, 0, 0, tzinfo=timezone.utc),
     end=datetime(2026, 12, 1, 4, 59, 59, tzinfo=timezone.utc),
 )
+
+#: Lo que `create_user` pide de verdad: una ventana, no una membresía. El
+#: personal no tiene membresía y por eso el método dejó de depender de ella.
+WINDOW = AccessWindow(start=MEMBERSHIP.start, end=MEMBERSHIP.end)
 
 
 class FakeResponse:
@@ -291,7 +296,7 @@ class CreateUserTests(unittest.TestCase):
 
         hikvision, session = device(OK_ENVELOPE)
 
-        employee_no = hikvision.create_user(USER, MEMBERSHIP)
+        employee_no = hikvision.create_user(USER, WINDOW)
 
         info = session.body()["UserInfo"]
         self.assertEqual(employee_no, "1394")
@@ -301,7 +306,7 @@ class CreateUserTests(unittest.TestCase):
     def test_el_alta_va_al_endpoint_de_registro(self) -> None:
         hikvision, session = device(OK_ENVELOPE)
 
-        hikvision.create_user(USER, MEMBERSHIP)
+        hikvision.create_user(USER, WINDOW)
 
         self.assertEqual(session.calls[0]["method"], "POST")
         self.assertTrue(session.calls[0]["url"].endswith("/ISAPI/AccessControl/UserInfo/Record?format=json"))
@@ -311,7 +316,7 @@ class CreateUserTests(unittest.TestCase):
 
         hikvision, session = device(OK_ENVELOPE)
 
-        hikvision.create_user(USER, MEMBERSHIP)
+        hikvision.create_user(USER, WINDOW)
 
         valid = session.body()["UserInfo"]["Valid"]
         self.assertEqual(valid["beginTime"], "2026-11-01T00:00:00")
@@ -322,7 +327,7 @@ class CreateUserTests(unittest.TestCase):
     def test_conserva_los_campos_que_el_equipo_necesita(self) -> None:
         hikvision, session = device(OK_ENVELOPE)
 
-        hikvision.create_user(USER, MEMBERSHIP)
+        hikvision.create_user(USER, WINDOW)
 
         info = session.body()["UserInfo"]
         self.assertEqual(info["userType"], "normal")
@@ -341,7 +346,7 @@ class CreateUserTests(unittest.TestCase):
 
         hikvision, session = device(OK_ENVELOPE)
 
-        hikvision.create_user(USER, MEMBERSHIP)
+        hikvision.create_user(USER, WINDOW)
 
         info = session.body()["UserInfo"]
         for campo in ("groupId", "userLevel", "localPassword", "userVerifyMode"):
@@ -352,7 +357,7 @@ class CreateUserTests(unittest.TestCase):
 
         hikvision, session = device(OK_ENVELOPE)
 
-        hikvision.create_user({**USER, "name": "A" * 120, "lastname": "B" * 120}, MEMBERSHIP)
+        hikvision.create_user({**USER, "name": "A" * 120, "lastname": "B" * 120}, WINDOW)
 
         self.assertEqual(len(session.body()["UserInfo"]["name"]), 128)
 
@@ -362,13 +367,13 @@ class CreateUserTests(unittest.TestCase):
         )
 
         with self.assertRaises(HikvisionDuplicateUserError):
-            hikvision.create_user(USER, MEMBERSHIP)
+            hikvision.create_user(USER, WINDOW)
 
     def test_un_rechazo_del_alta_es_un_error(self) -> None:
         hikvision, _ = device(FakeResponse({"statusCode": 4, "subStatusCode": "badParameters"}))
 
         with self.assertRaises(HikvisionResponseError):
-            hikvision.create_user(USER, MEMBERSHIP)
+            hikvision.create_user(USER, WINDOW)
 
 
 class TimezoneTests(unittest.TestCase):
@@ -451,14 +456,14 @@ class GenderTests(unittest.TestCase):
     def test_el_alta_de_una_socia_declara_female(self) -> None:
         hikvision, session = device(OK_ENVELOPE)
 
-        hikvision.create_user({**USER, "gender": "FEMALE"}, MEMBERSHIP)
+        hikvision.create_user({**USER, "gender": "FEMALE"}, WINDOW)
 
         self.assertEqual(session.body()["UserInfo"]["gender"], "female")
 
     def test_el_alta_sin_genero_declara_unknown(self) -> None:
         hikvision, session = device(OK_ENVELOPE)
 
-        hikvision.create_user({**USER, "gender": None}, MEMBERSHIP)
+        hikvision.create_user({**USER, "gender": None}, WINDOW)
 
         self.assertEqual(session.body()["UserInfo"]["gender"], "unknown")
 

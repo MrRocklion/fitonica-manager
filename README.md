@@ -99,11 +99,97 @@ Las imágenes se guardan en `users/` con el formato
 |---|---|---|
 | `NORMAL_PASS` | Un pulso del relé del paso normal (GPIO 21) | Sí |
 | `ESPECIAL_PASS` | Un pulso del relé del paso especial (GPIO 20) | Sí |
-| `UPDATE_FACE_ID` | Alta o actualización completa de un socio, **rostro incluido** | No |
+| `UPDATE_FACE_ID` | Alta o actualización completa de un **socio**, rostro incluido | No |
 | `SYNC_USER_ACCESS` | Mueve **sólo** la fecha final de vigencia de un socio ya registrado | No |
+| `UPDATE_STAFF_FACE_ID` | Alta o actualización de un miembro del **personal**, rostro incluido | No |
+| `DELETE_STAFF_MEMBER` | Retira del equipo a quien dejó el personal | No |
 
-Los cuatro llegan por el mismo tópico —el del dispositivo— y se distinguen por
-el campo `type`.
+Los seis llegan por el mismo tópico —el del dispositivo— y se distinguen por el
+campo `type`. **Sólo los dos primeros accionan un relé**; los otros cuatro son
+órdenes administrativas y no abren nada.
+
+### Socios frente a personal
+
+Son dos flujos paralelos porque **el personal no tiene membresía**: un
+recepcionista puede no haber comprado nunca un plan, de modo que
+`GET /api/devices/access/users/:id` —que exige una membresía vigente— le
+respondería `404`. De ahí que existan rutas propias contra `staff_membership`.
+
+| | Socio | Personal |
+|---|---|---|
+| Datos | `GET …/access/users/:id` | `GET …/access/staff/:id` |
+| Rostro | `GET …/users/:id/face-id/url` | `GET …/staff/:id/face-id/url` |
+| Confirmación | `POST …/users/:id/face-id/synced` | `POST …/staff/:id/face-id/synced` |
+| Error | — | `POST …/staff/:id/face-id/error` |
+| Vigencia | fechas de la membresía vendida | hoy 00:00 … **2035-12-31 23:59:59** |
+
+**Por qué una fecha fija y no «sin caducidad»:** `Valid` es obligatorio en el
+equipo y el firmware sólo admite fechas entre 2000 y 2037. 2035 queda
+holgadamente dentro y es lo bastante lejano como para que nadie se quede fuera
+por olvido. Quien deja la plantilla se retira con `DELETE_STAFF_MEMBER`, no
+esperando a que «venza».
+
+### Contrato de `UPDATE_STAFF_FACE_ID`
+
+```json
+{
+  "version": 1,
+  "command_id": "ab4f7c6a-f4ae-45d2-a0e5-f56eb8e5ee9a",
+  "type": "UPDATE_STAFF_FACE_ID",
+  "user_id": 123,
+  "requested_at": "2026-11-28T15:30:00.000Z",
+  "expires_at": "2026-11-28T15:30:10.000Z"
+}
+```
+
+Siete fases en cascada: validar → datos del personal → descargar el rostro →
+buscar el `employeeNo` → crear o extender la vigencia → cargar el rostro →
+marcar `SUBIDO` en el backend. Si falla una, no empieza la siguiente, y el
+`command_id` sólo se marca completado al terminar las siete. Un fallo al cargar
+el rostro se reporta con `POST …/staff/:id/face-id/error`, para que el panel lo
+distinga de un rostro que todavía no se ha intentado.
+
+### Contrato de `DELETE_STAFF_MEMBER`
+
+```json
+{
+  "version": 1,
+  "command_id": "c3f21ad8-91b7-4e0a-9f54-2d1c7b6e8a40",
+  "type": "DELETE_STAFF_MEMBER",
+  "user_id": 123,
+  "requested_at": "2026-11-28T15:30:00.000Z",
+  "expires_at": "2026-11-28T15:30:10.000Z"
+}
+```
+
+**No consulta al backend**, y es deliberado: cuando llega este comando el
+vínculo de personal **ya se borró**, así que `GET …/access/staff/:id`
+respondería `404` y el borrado no llegaría a hacerse nunca. El `user_id` del
+mensaje es todo lo que hace falta.
+
+Flujo: buscar el `employeeNo` → si no está, **no-op con éxito** (el objetivo ya
+se cumple, y se marca completado para que una reentrega no vuelva a buscar) →
+si está, borrar la ficha → comprobar si el equipo dejó el rostro en la librería
+y, si quedó huérfano, borrarlo también.
+
+**Un fallo técnico NO se marca como completado**, para que pueda reintentarse.
+La excepción es el rostro: si la ficha ya se borró, sin ella el equipo no deja
+pasar a nadie, así que un rostro huérfano no concede acceso y no merece
+repetir el comando entero.
+
+### La salvaguarda del socio que además es personal
+
+Hikvision identifica a la persona por `employeeNo = user.id`, y **ese ID es el
+mismo** lo sea como socia o como recepcionista: en el equipo hay **una sola
+ficha**. Por eso, antes de publicar `DELETE_STAFF_MEMBER`, el backend comprueba
+si conserva una membresía vigente en ese establecimiento:
+
+- **Sin membresía vigente** → se publica la baja.
+- **Con membresía vigente** → **no** se publica la baja, sino
+  `SYNC_USER_ACCESS`. Y no basta con «no borrar»: como personal tenía escrito
+  2035 en el equipo, de modo que limitarse a omitir el borrado la dejaría
+  entrando años después de que venza su plan. La sincronización le devuelve su
+  fecha real de clienta.
 
 ### `UPDATE_FACE_ID` frente a `SYNC_USER_ACCESS`
 
