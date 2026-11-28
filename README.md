@@ -86,6 +86,83 @@ print(user, image_path)
 Las imágenes se guardan en `users/` con el formato
 `<uuid>_<cedula>.<extension>`. La API key nunca se envía a la URL firmada de R2.
 
+## Comandos que recibe el manager
+
+| Comando | Qué hace | Relé |
+|---|---|---|
+| `NORMAL_PASS` | Un pulso del relé del paso normal (GPIO 21) | Sí |
+| `ESPECIAL_PASS` | Un pulso del relé del paso especial (GPIO 20) | Sí |
+| `UPDATE_FACE_ID` | Alta o actualización completa de un socio, **rostro incluido** | No |
+| `SYNC_USER_ACCESS` | Mueve **sólo** la fecha final de vigencia de un socio ya registrado | No |
+
+Los cuatro llegan por el mismo tópico —el del dispositivo— y se distinguen por
+el campo `type`.
+
+### `UPDATE_FACE_ID` frente a `SYNC_USER_ACCESS`
+
+Son dos comandos y no uno con un interruptor, porque hacen cosas distintas:
+
+| | `UPDATE_FACE_ID` | `SYNC_USER_ACCESS` |
+|---|---|---|
+| Descarga la imagen del rostro | Sí | **No** |
+| Da de alta a quien no existe | Sí | **No** |
+| Escribe la vigencia | Completa (alta) o sólo el final (renovación) | **Sólo el final** |
+| Carga o reemplaza el rostro | Sí | **No** |
+| Cambia `face_status` | Sí (`SUBIDO`) | **No** |
+| Acciona algún relé | No | No |
+
+Fundirlos obligaría a bajarse la foto del almacenamiento **en cada renovación**
+sólo para mover una fecha.
+
+### Contrato de `SYNC_USER_ACCESS`
+
+```json
+{
+  "version": 1,
+  "command_id": "ab4f7c6a-f4ae-45d2-a0e5-f56eb8e5ee9a",
+  "type": "SYNC_USER_ACCESS",
+  "user_id": 1394,
+  "requested_at": "2026-11-28T15:30:00.000Z",
+  "expires_at": "2026-11-28T15:30:10.000Z"
+}
+```
+
+**Seis campos y ninguno más.** No lleva nombre, documento, fechas de la
+membresía, URL del rostro ni credenciales: quien escuche el tópico obtiene un ID
+de usuario y nada aprovechable. La vigencia la consulta el propio dispositivo
+contra `GET /api/devices/access/users/:id`, autenticándose con su Device API
+Key — **la API es la fuente de verdad**, no el mensaje.
+
+**Cuándo lo publica el backend:** al vender la primera membresía desde
+«+ Nuevo cliente» y al renovar, siempre **después** de que la transacción haya
+hecho commit. «Terminar sin membresía» no publica nada: sin vigencia no hay
+nada que sincronizar.
+
+### Flujo de `SYNC_USER_ACCESS`
+
+```
+1. validar          user_id entero positivo, command_id presente,
+                    orden no caducada, no repetida
+2. Fitonica         GET /api/devices/access/users/:id → membresía vigente
+3. buscar           POST /ISAPI/AccessControl/UserInfo/Search (employeeNo)
+4a. NO existe       se registra en el log y NO se hace nada más
+4b. SÍ existe       PUT .../UserInfo/Modify con sólo Valid.endTime
+```
+
+**Si la persona no está en el equipo no se la da de alta.** El alta exige su
+rostro, que es justo lo que este comando no descarga: ese trabajo es de
+`UPDATE_FACE_ID`. El `command_id` **no** se marca como completado en ese caso,
+de modo que una sincronización posterior sí podrá escribir la vigencia cuando el
+socio ya esté registrado.
+
+**«No existe» y «no se pudo preguntar» son cosas distintas.** Un timeout o un
+error HTTP durante la búsqueda se registran como fallo técnico y no se toca el
+equipo; confundirlos llevaría a intentar un alta que no corresponde.
+
+**El `Valid.beginTime` del equipo se conserva intacto.** El `start_date` de la
+membresía se mueve en cada renovación, y usarlo aquí reescribiría la fecha de
+ingreso de la persona.
+
 ## Sincronización con el equipo Hikvision
 
 Cuando llega un `UPDATE_FACE_ID` por MQTT, `main.handle_update_face_id` pone al
@@ -241,7 +318,9 @@ llegar dos veces. El flujo es idempotente por construcción: buscar por
 y `FDSetUp` reemplaza el rostro del mismo `FPID`.
 
 Además, `main` recuerda los `command_id` **completados con éxito** (los últimos
-512, en memoria) y descarta la reentrega. Un comando que falló **no** se anota:
+512, en memoria) y descarta la reentrega. `SYNC_USER_ACCESS` comparte esa misma
+memoria y es idempotente por construcción: reescribir la misma fecha final deja
+el equipo igual. Un comando que falló **no** se anota:
 la reentrega es una segunda oportunidad. **Limitación conocida:** esa memoria es
 del proceso y se pierde al reiniciar el servicio; repetir una sincronización es
 inocuo, así que no se persiste.

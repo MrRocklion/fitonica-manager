@@ -723,3 +723,308 @@ class FaceStatusTests(MainTestCase):
             main.on_message(None, None, message(command()))
 
         self.assertEqual(self.names(api).count("confirm_face_id_synced"), 1)
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# SYNC_USER_ACCESS
+# ════════════════════════════════════════════════════════════════════════════
+
+def sync_command(**overrides: object) -> dict:
+    """Un `SYNC_USER_ACCESS` con la forma exacta del contrato del backend."""
+
+    now = datetime.now(timezone.utc)
+    return {
+        "version": 1,
+        "command_id": "s-123",
+        "type": "SYNC_USER_ACCESS",
+        "user_id": 1394,
+        "requested_at": now.isoformat(),
+        "expires_at": (now + timedelta(seconds=10)).isoformat(),
+        **overrides,
+    }
+
+
+FOUND_USER = {"employeeNo": "1394", "Valid": {"beginTime": "2025-03-15T08:30:00"}}
+
+
+class SyncUserAccessTests(MainTestCase):
+    """
+    LO QUE PROTEGEN ESTAS PRUEBAS
+    -----------------------------
+     1. QUE NO ABRA LA PUERTA. Es una sincronización de datos; si acabara en
+        `PASS_HANDLERS`, vender una membresía accionaría un relé.
+     2. QUE NO HAGA EL TRABAJO DE `UPDATE_FACE_ID`. No descarga imágenes, no da
+        de alta a nadie y no toca `face_status`: fundir los dos comandos
+        obligaría a bajarse la foto del almacenamiento en cada renovación sólo
+        para mover una fecha.
+     3. QUE «NO EXISTE» Y «NO SE PUDO PREGUNTAR» SIGAN SIENDO COSAS DISTINTAS.
+     4. QUE LA FECHA DE INICIO DEL EQUIPO NO SE PISE con la de la renovación.
+    """
+
+    def test_se_despacha_a_su_propio_manejador(self) -> None:
+        api, equipo = FakeFitonica(), FakeHikvision(found=FOUND_USER)
+        self.wire(api, equipo)
+
+        with self.assertLogs("main", level="INFO"):
+            main.on_message(None, None, message(sync_command()))
+
+        self.assertEqual(self.names(equipo), ["find_user", "update_user_end_date"])
+
+    def test_no_esta_en_la_tabla_de_reles(self) -> None:
+        """La separación es estructural, no una rama del `if`."""
+
+        self.assertNotIn("SYNC_USER_ACCESS", main.PASS_HANDLERS)
+        self.assertEqual(sorted(main.PASS_HANDLERS), ["ESPECIAL_PASS", "NORMAL_PASS"])
+
+    def test_no_acciona_ningun_rele(self) -> None:
+        api, equipo = FakeFitonica(), FakeHikvision(found=FOUND_USER)
+        self.wire(api, equipo)
+
+        with self.assertLogs("main", level="INFO"):
+            main.on_message(None, None, message(sync_command()))
+
+        self.assertEqual(StubOutputDevice.events, [])
+
+    # ------------------------------------------------------- Validación
+
+    def test_rechaza_un_user_id_invalido_sin_consultar_nada(self) -> None:
+        for invalido in (None, 0, -5, "1394", 1.5, True):
+            with self.subTest(user_id=invalido):
+                api, equipo = FakeFitonica(), FakeHikvision(found=FOUND_USER)
+                self.wire(api, equipo)
+
+                with self.assertLogs("main", level="WARNING"):
+                    main.on_message(None, None, message(sync_command(user_id=invalido)))
+
+                self.assertEqual(api.calls, [])
+                self.assertEqual(equipo.calls, [])
+
+    def test_rechaza_un_comando_sin_command_id(self) -> None:
+        api, equipo = FakeFitonica(), FakeHikvision(found=FOUND_USER)
+        self.wire(api, equipo)
+        orden = sync_command()
+        del orden["command_id"]
+
+        with self.assertLogs("main", level="WARNING"):
+            main.on_message(None, None, message(orden))
+
+        self.assertEqual(api.calls, [])
+        self.assertEqual(equipo.calls, [])
+
+    def test_una_orden_caducada_no_consulta_fitonica_ni_el_equipo(self) -> None:
+        api, equipo = FakeFitonica(), FakeHikvision(found=FOUND_USER)
+        self.wire(api, equipo)
+        vieja = datetime.now(timezone.utc) - timedelta(minutes=5)
+
+        with self.assertLogs("main", level="WARNING") as registro:
+            main.on_message(None, None, message(sync_command(expires_at=vieja.isoformat())))
+
+        self.assertEqual(api.calls, [])
+        self.assertEqual(equipo.calls, [])
+        self.assertIn("caduco", "\n".join(registro.output))
+
+    def test_una_reentrega_ya_completada_se_ignora(self) -> None:
+        api, equipo = FakeFitonica(), FakeHikvision(found=FOUND_USER)
+        self.wire(api, equipo)
+
+        with self.assertLogs("main", level="INFO"):
+            main.on_message(None, None, message(sync_command()))
+            main.on_message(None, None, message(sync_command()))
+
+        self.assertEqual(self.names(equipo).count("update_user_end_date"), 1)
+
+    # --------------------------------------------- Usuario y membresía
+
+    def test_consulta_una_sola_vez_el_usuario(self) -> None:
+        api, equipo = FakeFitonica(), FakeHikvision(found=FOUND_USER)
+        self.wire(api, equipo)
+
+        with self.assertLogs("main", level="INFO"):
+            main.on_message(None, None, message(sync_command()))
+
+        self.assertEqual(self.names(api), ["get_user"])
+
+    def test_registra_la_vigencia_obtenida(self) -> None:
+        api, equipo = FakeFitonica(), FakeHikvision(found=FOUND_USER)
+        self.wire(api, equipo)
+
+        with self.assertLogs("main", level="INFO") as registro:
+            main.on_message(None, None, message(sync_command()))
+
+        salida = "\n".join(registro.output)
+        self.assertIn("SYNC_USER_ACCESS s-123", salida)
+        self.assertIn("membresia 123 vigente hasta 2026-11-30", salida)
+
+    def test_sin_membresia_vigente_no_toca_el_equipo(self) -> None:
+        api = FakeFitonica(fail_user=FitonicaError("404 sin membresia vigente"))
+        equipo = FakeHikvision(found=FOUND_USER)
+        self.wire(api, equipo)
+
+        with self.assertLogs("main", level="ERROR"):
+            main.on_message(None, None, message(sync_command()))
+
+        self.assertEqual(equipo.calls, [])
+
+    # ------------------------------------------------ Búsqueda en Hikvision
+
+    def test_busca_por_el_id_de_fitonica(self) -> None:
+        api, equipo = FakeFitonica(), FakeHikvision(found=FOUND_USER)
+        self.wire(api, equipo)
+
+        with self.assertLogs("main", level="INFO"):
+            main.on_message(None, None, message(sync_command()))
+
+        self.assertEqual(equipo.calls[0], ("find_user", 1394))
+
+    def test_si_no_existe_no_cambia_nada(self) -> None:
+        """No se da de alta: eso exige el rostro, que este comando no descarga."""
+
+        api, equipo = FakeFitonica(), FakeHikvision(found=None)
+        self.wire(api, equipo)
+
+        with self.assertLogs("main", level="WARNING") as registro:
+            main.on_message(None, None, message(sync_command()))
+
+        self.assertEqual(self.names(equipo), ["find_user"])
+        self.assertIn(
+            "employeeNo 1394 no existe en Hikvision; no se realizaron cambios",
+            "\n".join(registro.output),
+        )
+
+    def test_si_no_existe_queda_reintentable(self) -> None:
+        """Cuando `UPDATE_FACE_ID` lo dé de alta, una sincronización posterior sí podrá."""
+
+        api, equipo = FakeFitonica(), FakeHikvision(found=None)
+        self.wire(api, equipo)
+
+        with self.assertLogs("main", level="WARNING"):
+            main.on_message(None, None, message(sync_command()))
+
+        self.assertNotIn("s-123", main._COMPLETED_COMMANDS)
+
+    def test_un_fallo_de_comunicacion_no_es_no_encontrado(self) -> None:
+        api = FakeFitonica()
+        equipo = FakeHikvision(find_user=HikvisionCommunicationError("sin respuesta en 20 s"))
+        self.wire(api, equipo)
+
+        with self.assertLogs("main", level="ERROR") as registro:
+            main.on_message(None, None, message(sync_command()))
+
+        self.assertEqual(self.names(equipo), ["find_user"])
+        self.assertIn("fallo la busqueda", "\n".join(registro.output))
+
+    # ------------------------------------------------- Actualización
+
+    def test_actualiza_solo_el_final_conservando_el_inicio(self) -> None:
+        api, equipo = FakeFitonica(), FakeHikvision(found=FOUND_USER)
+        self.wire(api, equipo)
+
+        with self.assertLogs("main", level="INFO"):
+            main.on_message(None, None, message(sync_command()))
+
+        llamadas = [call for call in equipo.calls if call[0] == "update_user_end_date"]
+        self.assertEqual(len(llamadas), 1)
+        _, user_id, end_date, begin_time = llamadas[0]
+        self.assertEqual(user_id, 1394)
+        self.assertEqual(end_date.isoformat(), "2026-12-01T04:59:59.999000+00:00")
+        self.assertEqual(begin_time, "2025-03-15T08:30:00")
+
+    def test_el_inicio_del_equipo_no_se_sustituye_por_el_de_la_renovacion(self) -> None:
+        api, equipo = FakeFitonica(), FakeHikvision(found=FOUND_USER)
+        self.wire(api, equipo)
+
+        with self.assertLogs("main", level="INFO"):
+            main.on_message(None, None, message(sync_command()))
+
+        begin_time = equipo.calls[1][3]
+        # El `start_date` de la membresía es el 1 de noviembre; el del equipo, marzo.
+        self.assertEqual(begin_time, "2025-03-15T08:30:00")
+        self.assertNotIn("2026-11", begin_time)
+
+    def test_un_fallo_al_actualizar_no_marca_el_comando(self) -> None:
+        api = FakeFitonica()
+        equipo = FakeHikvision(
+            found=FOUND_USER, update_user_end_date=HikvisionError("rechazado")
+        )
+        self.wire(api, equipo)
+
+        with self.assertLogs("main", level="ERROR"):
+            main.on_message(None, None, message(sync_command()))
+
+        self.assertNotIn("s-123", main._COMPLETED_COMMANDS)
+
+    def test_solo_marca_completado_tras_escribir_en_el_equipo(self) -> None:
+        api, equipo = FakeFitonica(), FakeHikvision(found=FOUND_USER)
+        self.wire(api, equipo)
+
+        with self.assertLogs("main", level="INFO"):
+            main.on_message(None, None, message(sync_command()))
+
+        self.assertIn("s-123", main._COMPLETED_COMMANDS)
+
+    # ------------------------------------- Lo que NUNCA debe llamar
+
+    def test_nunca_descarga_imagenes_ni_crea_usuarios(self) -> None:
+        """La diferencia con `UPDATE_FACE_ID`, en una sola aserción."""
+
+        api, equipo = FakeFitonica(), FakeHikvision(found=FOUND_USER)
+        self.wire(api, equipo)
+
+        with self.assertLogs("main", level="INFO"):
+            main.on_message(None, None, message(sync_command()))
+
+        for prohibido in ("download_face_id", "confirm_face_id_synced"):
+            self.assertNotIn(prohibido, self.names(api))
+        for prohibido in ("create_user", "update_face"):
+            self.assertNotIn(prohibido, self.names(equipo))
+
+    def test_tampoco_los_llama_cuando_el_usuario_no_existe(self) -> None:
+        api, equipo = FakeFitonica(), FakeHikvision(found=None)
+        self.wire(api, equipo)
+
+        with self.assertLogs("main", level="WARNING"):
+            main.on_message(None, None, message(sync_command()))
+
+        self.assertEqual(self.names(api), ["get_user"])
+        self.assertEqual(self.names(equipo), ["find_user"])
+
+    # ----------------------------------------- Robustez del servicio
+
+    def test_una_excepcion_no_derriba_el_servicio(self) -> None:
+        api = FakeFitonica()
+        equipo = FakeHikvision(find_user=RuntimeError("algo inesperado"))
+        self.wire(api, equipo)
+
+        with self.assertLogs("main", level="ERROR") as registro:
+            main.on_message(None, None, message(sync_command()))
+
+        self.assertIn("error no controlado", "\n".join(registro.output))
+
+    def test_el_siguiente_comando_se_procesa_igual(self) -> None:
+        api = FakeFitonica()
+        equipo = FakeHikvision(found=FOUND_USER, find_user=RuntimeError("fallo puntual"))
+        self.wire(api, equipo)
+
+        with self.assertLogs("main", level="ERROR"):
+            main.on_message(None, None, message(sync_command()))
+
+        # Segundo comando con el equipo ya sano: tiene que completarse.
+        sano = FakeHikvision(found=FOUND_USER)
+        self.wire(FakeFitonica(), sano)
+
+        with self.assertLogs("main", level="INFO"):
+            main.on_message(None, None, message(sync_command(command_id="s-456")))
+
+        self.assertIn("update_user_end_date", self.names(sano))
+
+    def test_un_pase_sigue_funcionando_despues(self) -> None:
+        """La compatibilidad con los relés no se rompe por el comando nuevo."""
+
+        api, equipo = FakeFitonica(), FakeHikvision(found=FOUND_USER)
+        self.wire(api, equipo)
+
+        with self.assertLogs("main", level="INFO"):
+            main.on_message(None, None, message(sync_command()))
+            main.on_message(None, None, message({"type": "NORMAL_PASS", "command_id": "p-1"}))
+
+        self.assertEqual(StubOutputDevice.events, ["on:21", "off:21"])

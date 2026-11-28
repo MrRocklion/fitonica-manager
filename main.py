@@ -6,7 +6,7 @@ import os
 from collections import deque
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Mapping, Optional, Tuple
 from urllib.parse import urlparse
 
 import paho.mqtt.client as mqtt
@@ -132,6 +132,12 @@ def _handle_message(message):
         handle_update_face_id(command)
         return
 
+    if command_type == "SYNC_USER_ACCESS":
+        # TAMPOCO ACCIONA NINGUN RELE: solo mueve la fecha de vigencia de
+        # alguien que ya esta dado de alta en el equipo.
+        handle_sync_user_access(command)
+        return
+
     handler = PASS_HANDLERS.get(command_type)
 
     if handler is None:
@@ -160,28 +166,12 @@ def handle_update_face_id(command: Mapping[str, Any]) -> None:
     porque el `FPID` al que asociarlo todavia no existe.
     """
 
-    command_id = command.get("command_id")
-    user_id = command.get("user_id")
-
     # ---------------------------------------------------- 1. validar el comando
-    if isinstance(user_id, bool) or not isinstance(user_id, int) or user_id <= 0:
-        logger.warning("UPDATE_FACE_ID descartado: user_id invalido (%r)", user_id)
+    accepted = _accept_user_command(command, "UPDATE_FACE_ID")
+    if accepted is None:
         return
 
-    if not isinstance(command_id, str) or not command_id.strip():
-        logger.warning(
-            "UPDATE_FACE_ID descartado: falta command_id (usuario %s)", user_id
-        )
-        return
-
-    tag = f"UPDATE_FACE_ID {command_id}"
-
-    if command_id in _COMPLETED_COMMANDS:
-        logger.info("%s ignorado: ya se sincronizo con exito antes", tag)
-        return
-
-    if _expired(command.get("expires_at"), tag):
-        return
+    user_id, command_id, tag = accepted
 
     # ------------------------------------------- 2. usuario y membresia vigente
     try:
@@ -304,6 +294,138 @@ def handle_update_face_id(command: Mapping[str, Any]) -> None:
     # Se anota al final: solo un exito completo convierte una reentrega en
     # trabajo innecesario.
     _COMPLETED_COMMANDS.append(command_id)
+
+
+def handle_sync_user_access(command: Mapping[str, Any]) -> None:
+    """
+    Pone al dia hasta cuando puede entrar alguien que YA esta en el equipo.
+
+    SE PUBLICA AL VENDER O RENOVAR una membresia. Es lo minimo que hay que
+    cambiar en el aparato para que la persona siga pasando: una sola fecha.
+
+    EN QUE SE DIFERENCIA DE `UPDATE_FACE_ID`, y por que son dos manejadores y
+    no uno con un interruptor:
+
+        UPDATE_FACE_ID    descarga la imagen, DA DE ALTA a quien no existe,
+                          carga el rostro y confirma `face_status` en la API.
+        SYNC_USER_ACCESS  no descarga nada, no crea a nadie, no toca el rostro
+                          y no toca `face_status`.
+
+    Fundirlos obligaria a bajarse la foto del almacenamiento en cada renovacion
+    solo para mover una fecha.
+
+    SI LA PERSONA NO ESTA EN EL EQUIPO NO SE HACE NADA. Darla de alta aqui
+    exigiria su rostro, que es justo lo que este comando no descarga; el alta es
+    trabajo de `UPDATE_FACE_ID`, que el backend publica cuando hay imagen.
+
+    NO ACCIONA NINGUN RELE.
+    """
+
+    # ---------------------------------------------------- 1. validar el comando
+    accepted = _accept_user_command(command, "SYNC_USER_ACCESS")
+    if accepted is None:
+        return
+
+    user_id, command_id, tag = accepted
+
+    # ------------------------------------------- 2. usuario y membresia vigente
+    try:
+        user = fitonica.get_user(user_id)
+        membership = parse_membership(user)
+    except (FitonicaError, ValueError) as error:
+        # Sin membresia vigente no hay vigencia que escribir: no se toca el
+        # equipo ni se marca el comando, para que un reintento posterior pueda
+        # hacerlo cuando el dato exista.
+        logger.error("%s: no se pudo obtener el usuario %s de Fitonica: %s", tag, user_id, error)
+        return
+
+    # La hora del establecimiento, que es la que acabara escrita en el aparato.
+    fin = membership.end.astimezone(hikvision.timezone)
+    logger.info(
+        "%s: usuario Fitonica %s obtenido; membresia %s vigente hasta %s",
+        tag, user_id, membership.id, fin.strftime("%Y-%m-%d %H:%M"),
+    )
+
+    # ------------------------------------- 3. buscar el employeeNo en el equipo
+    try:
+        found = hikvision.find_user(user_id)
+    except HikvisionError as error:
+        # «No se pudo preguntar» NO es «no existe»: no se intenta nada mas.
+        logger.error("%s: fallo la busqueda del employeeNo %s: %s", tag, user_id, error)
+        return
+
+    # ------------------------------------------------- 4. la persona no esta
+    if found is None:
+        logger.warning(
+            "%s: employeeNo %s no existe en Hikvision; no se realizaron cambios",
+            tag, user_id,
+        )
+        # NO se marca como completado: cuando `UPDATE_FACE_ID` la dé de alta,
+        # una sincronizacion posterior si podra escribir la vigencia.
+        return
+
+    # ------------------------------------------- 5. actualizar SOLO el final
+    # El inicio que el equipo ya tiene, para reenviarlo intacto: la fecha de
+    # ingreso de la persona no se recalcula en una renovacion.
+    begin_time = hikvision.existing_begin_time(found)
+
+    try:
+        hikvision.update_user_end_date(user_id, membership.end, begin_time=begin_time)
+    except (HikvisionError, ValueError) as error:
+        logger.error(
+            "%s: fallo la actualizacion de la vigencia del employeeNo %s: %s",
+            tag, user_id, error,
+        )
+        return
+
+    logger.info(
+        "%s: vigencia del employeeNo %s actualizada hasta %s (hora local); inicio %s conservado",
+        tag, user_id, fin.strftime("%Y-%m-%d %H:%M"), begin_time or "sin cambios",
+    )
+
+    # Solo tras escribir de verdad en el equipo.
+    _COMPLETED_COMMANDS.append(command_id)
+
+
+def _accept_user_command(
+    command: Mapping[str, Any],
+    command_type: str,
+) -> Optional[Tuple[int, str, str]]:
+    """
+    Sobre comun de los comandos que llevan usuario.
+
+    Devuelve `(user_id, command_id, tag)` o `None` si hay que descartarlo, ya
+    registrado. Vive aqui y no duplicado en cada manejador porque las cuatro
+    comprobaciones —usuario, identificador, caducidad y repeticion— son las
+    mismas para `UPDATE_FACE_ID` y `SYNC_USER_ACCESS`; lo que cambia entre
+    ellos es lo que hacen DESPUES.
+
+    UN COMANDO CADUCADO NO LLEGA A CONSULTAR NADA: ni a Fitonica ni al equipo.
+    """
+
+    command_id = command.get("command_id")
+    user_id = command.get("user_id")
+
+    # `isinstance(True, int)` es cierto en Python: sin la guarda, un `true` del
+    # JSON pasaria por el usuario numero 1.
+    if isinstance(user_id, bool) or not isinstance(user_id, int) or user_id <= 0:
+        logger.warning("%s descartado: user_id invalido (%r)", command_type, user_id)
+        return None
+
+    if not isinstance(command_id, str) or not command_id.strip():
+        logger.warning("%s descartado: falta command_id (usuario %s)", command_type, user_id)
+        return None
+
+    tag = f"{command_type} {command_id}"
+
+    if command_id in _COMPLETED_COMMANDS:
+        logger.info("%s ignorado: ya se completo con exito antes", tag)
+        return None
+
+    if _expired(command.get("expires_at"), tag):
+        return None
+
+    return user_id, command_id, tag
 
 
 def _expired(expires_at: object, tag: str) -> bool:
