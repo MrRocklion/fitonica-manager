@@ -25,6 +25,13 @@ pip install paho-mqtt python-dotenv gpiozero lgpio requests pillow
 ```
 
 `requests` lo usa `hikvision.py` para hablar ISAPI con Digest Authentication.
+
+El cliente conserva una sesión HTTP para reducir el costo del reto Digest. Si
+el equipo devuelve un `401` final después de haber funcionado —algunos firmwares
+invalidan el nonce almacenado—, se descarta esa sesión, se crea una nueva y se
+reintenta la operación exactamente una vez. Un segundo `401` termina el comando
+con error: no existe ningún bucle de reautenticación. En cargas multipart el
+archivo se rebobina antes del segundo intento para no enviar una imagen vacía.
 `pillow` lo usa `face_image.py` para convertir la foto a JPEG: **sin él el
 servicio arranca igual** (el import es perezoso), pero toda sincronización de
 rostro falla con un mensaje que lo dice.

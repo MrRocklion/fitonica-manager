@@ -196,6 +196,9 @@ class Hikvision:
         # Cada metodo concatena "/ISAPI/...", asi que la base no lleva barra final.
         self.api_url = api_url.rstrip("/")
         self.user = username
+        # Se conserva sólo para poder renovar la sesión Digest si el firmware
+        # invalida su nonce. Nunca se registra ni se incluye en excepciones.
+        self._password = password
         self.timeout = timeout
         self.timezone = ZoneInfo(timezone)
 
@@ -204,8 +207,20 @@ class Hikvision:
         # verificacion desactivada sin que nadie lo decida.
         self.verify_tls = verify_tls if self.api_url.startswith("https://") else True
 
-        self._session = requests.Session()
-        self._session.auth = HTTPDigestAuth(username, password)
+        self._session = self._new_session()
+
+    def _new_session(self) -> requests.Session:
+        """Crea una sesión limpia con autenticación Digest."""
+
+        session = requests.Session()
+        session.auth = HTTPDigestAuth(self.user, self._password)
+        return session
+
+    def _reset_session(self) -> None:
+        """Descarta el nonce/conexión anterior y fuerza un reto Digest nuevo."""
+
+        self._session.close()
+        self._session = self._new_session()
 
     @classmethod
     def from_env(cls) -> "Hikvision":
@@ -508,22 +523,22 @@ class Hikvision:
 
         url = f"{self.api_url}{path}"
 
-        try:
-            response = self._session.request(
-                method,
-                url,
-                timeout=self.timeout,
-                verify=self.verify_tls,
-                **kwargs,
+        response = self._send(method, url, action=action, **kwargs)
+
+        # Algunos firmwares invalidan el nonce Digest después de varias
+        # operaciones aunque la contraseña siga siendo correcta. `requests`
+        # ya atiende el reto normal internamente; un 401 FINAL significa que el
+        # estado conservado en la sesión dejó de ser aceptado. Se crea una
+        # sesión nueva y se reintenta UNA sola vez: nunca hay un bucle infinito.
+        if response.status_code == 401:
+            logger.warning(
+                "%s: Hikvision rechazo la sesion Digest; se renovara y "
+                "se reintentara una sola vez",
+                action,
             )
-        except requests.exceptions.Timeout as error:
-            raise HikvisionCommunicationError(
-                f"{action}: el equipo no respondio en {self.timeout:g} s"
-            ) from error
-        except requests.exceptions.RequestException as error:
-            raise HikvisionCommunicationError(
-                f"{action}: no se pudo contactar al equipo ({type(error).__name__})"
-            ) from error
+            self._rewind_files(kwargs.get("files"))
+            self._reset_session()
+            response = self._send(method, url, action=action, **kwargs)
 
         # Nivel DEBUG: en soporte se abre con FITONICA_LOG_LEVEL=DEBUG y deja la
         # traza de cada peticion al equipo. Nunca el cuerpo, que repite datos
@@ -552,6 +567,39 @@ class Hikvision:
 
         self._check_isapi_status(payload, action)
         return payload
+
+    def _send(self, method: str, url: str, *, action: str, **kwargs: Any):
+        """Ejecuta un único intento HTTP conservando la clasificación de errores."""
+
+        try:
+            return self._session.request(
+                method,
+                url,
+                timeout=self.timeout,
+                verify=self.verify_tls,
+                **kwargs,
+            )
+        except requests.exceptions.Timeout as error:
+            raise HikvisionCommunicationError(
+                f"{action}: el equipo no respondio en {self.timeout:g} s"
+            ) from error
+        except requests.exceptions.RequestException as error:
+            raise HikvisionCommunicationError(
+                f"{action}: no se pudo contactar al equipo ({type(error).__name__})"
+            ) from error
+
+    @staticmethod
+    def _rewind_files(files: object) -> None:
+        """Rebobina archivos multipart para que el segundo intento no vaya vacío."""
+
+        if not isinstance(files, Mapping):
+            return
+
+        for value in files.values():
+            candidate = value[1] if isinstance(value, tuple) and len(value) > 1 else value
+            seek = getattr(candidate, "seek", None)
+            if callable(seek):
+                seek(0)
 
     @staticmethod
     def _check_isapi_status(payload: Mapping[str, Any], action: str) -> None:

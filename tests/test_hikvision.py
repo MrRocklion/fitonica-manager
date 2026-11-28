@@ -24,10 +24,12 @@ from __future__ import annotations
 import json
 import sys
 import unittest
+from io import BytesIO
 from datetime import datetime, timezone
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from zoneinfo import ZoneInfo
+from unittest.mock import patch
 
 import requests
 
@@ -203,6 +205,39 @@ class FindUserTests(unittest.TestCase):
             hikvision.find_user(1394)
 
         self.assertEqual(capturado.exception.http_status, 500)
+
+    def test_un_401_renueva_digest_y_reintenta_una_sola_vez(self) -> None:
+        hikvision, expired_session = device(FakeResponse(None, status_code=401))
+        renewed_session = FakeSession(NO_MATCH)
+
+        with patch("hikvision.requests.Session", return_value=renewed_session):
+            result = hikvision.find_user(1394)
+
+        self.assertIsNone(result)
+        self.assertTrue(expired_session.closed)
+        self.assertEqual(len(expired_session.calls), 1)
+        self.assertEqual(len(renewed_session.calls), 1)
+        self.assertIsInstance(renewed_session.auth, requests.auth.HTTPDigestAuth)
+
+    def test_dos_401_fallan_sin_crear_un_bucle(self) -> None:
+        hikvision, expired_session = device(FakeResponse(None, status_code=401))
+        renewed_session = FakeSession(FakeResponse(None, status_code=401))
+
+        with patch("hikvision.requests.Session", return_value=renewed_session):
+            with self.assertRaises(HikvisionResponseError) as captured:
+                hikvision.find_user(1394)
+
+        self.assertEqual(captured.exception.http_status, 401)
+        self.assertEqual(len(expired_session.calls), 1)
+        self.assertEqual(len(renewed_session.calls), 1)
+
+    def test_rebobina_un_archivo_multipart_antes_del_reintento(self) -> None:
+        image = BytesIO(b"imagen-completa")
+        image.read()
+
+        Hikvision._rewind_files({"img": ("rostro.jpeg", image, "image/jpeg")})
+
+        self.assertEqual(image.read(), b"imagen-completa")
 
     def test_un_json_invalido_no_es_no_encontrado(self) -> None:
         hikvision, _ = device(FakeResponse(None, text="<html>"))
